@@ -1,11 +1,19 @@
 // ==UserScript==
 // @name         SD Monitor - Live Acknowledge Popup
 // @namespace    geodis-sd-monitor
-// @version      0.11
+// @version      0.12
 // @description  Cross-site synced live alert for unacknowledged tickets; full function on ServiceNow, mirrored popups elsewhere
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.js
+// @changelog    0.12 - Acknowledging an incident no longer overwrites an Impact somebody had
+//                     already set. The mandatory-field step filled Impact whenever it wasn't
+//                     already 3-Low, but clicking Acknowledge submits the whole form, so that
+//                     value was saved — and since ServiceNow derives Priority from Impact ×
+//                     Urgency, acknowledging an incident raised as 1-High silently dropped it
+//                     to Low and moved its SLA target with it. It now fills Impact only when
+//                     the field is genuinely empty, which is the case the step exists for, and
+//                     the value it uses in that case is CONFIG.ACK_FALLBACK_IMPACT.
 // @changelog    0.11 - Authentication fix, the same one the assignment dashboard took in its 0.5:
 //                     the browser no longer prompts for credentials. Requests ride the SSO session
 //                     cookies as before, but they now also carry the session token (g_ck) that
@@ -89,6 +97,11 @@
         // state=7 is Closed; a closed incident can apparently still read u_substate=0,
         // so exclude it explicitly.
         EXTRA_FILTER: { incident: 'stateNOT IN7' },
+        // Impact written to an incident that has none, purely to clear the mandatory
+        // field blocking its Acknowledge button. Only ever applied to a blank Impact —
+        // an Impact somebody has already judged is never overwritten. 3 = Low, i.e.
+        // the least presumptuous value; whoever works the ticket can raise it.
+        ACK_FALLBACK_IMPACT: '3',
         POLL_MS: 15000,
         COUNTDOWN_SECONDS: 120,
         ACKED_LIFETIME_MS: 5 * 60 * 1000,
@@ -285,11 +298,19 @@
     function fillMandatoryAckFields(doc, table) {
         if (table !== 'incident') return;
 
+        // Only fill Impact when the ticket genuinely has none. Clicking Acknowledge
+        // submits the whole form, so anything we change here is *saved* — and because
+        // ServiceNow derives Priority from Impact × Urgency, overwriting a real Impact
+        // would silently re-prioritise the incident. Acknowledging a P1 raised as
+        // 1-High would have quietly dropped it to Low and moved its SLA target. An
+        // unset choice comes through as the empty option, so an empty value is the
+        // only safe signal that nobody has judged this ticket's impact yet.
         const impactSelect = doc.getElementById('incident.impact');
-        if (impactSelect && impactSelect.value !== '3') {
-            impactSelect.value = '3'; // 3 = Low
+        if (impactSelect && !String(impactSelect.value || '').trim()) {
+            impactSelect.value = CONFIG.ACK_FALLBACK_IMPACT;
             impactSelect.dispatchEvent(new Event('change', { bubbles: true }));
             impactSelect.dispatchEvent(new Event('input', { bubbles: true }));
+            console.log(`[ACK Monitor] incident had no Impact — set ${CONFIG.ACK_FALLBACK_IMPACT} to satisfy the mandatory field.`);
         }
 
         const workNotes = doc.getElementById('activity-stream-work_notes-textarea');
