@@ -1,0 +1,14 @@
+{
+  "name": "sd-monitor-tests",
+  "private": true,
+  "description": "Browser tests for the SD Monitor userscripts",
+  "scripts": {
+    "test": "node run.js",
+    "test:session": "node session.test.js",
+    "test:acknowledge": "node acknowledge.test.js",
+    "test:popup": "node popup.test.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.56.0"
+  }
+}
