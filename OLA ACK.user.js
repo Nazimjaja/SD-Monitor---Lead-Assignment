@@ -1,11 +1,27 @@
 // ==UserScript==
 // @name         SD Monitor - Live Acknowledge Popup
 // @namespace    geodis-sd-monitor
-// @version      0.13
+// @version      0.14
 // @description  Cross-site synced live alert for unacknowledged tickets; full function on ServiceNow, mirrored popups elsewhere
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
+// @changelog    0.14 - Acknowledging no longer dead-ends in "Timed out waiting for the
+//                     Acknowledge button/confirmation". Two changes. The frame the ticket
+//                     form loads in was 1px by 1px at opacity 0: that lays the form out at
+//                     1px wide and makes it exactly the kind of zero-area frame Chrome
+//                     throttles timers in, while ServiceNow's submit path runs on timers —
+//                     so the click landed and then nothing happened until the timeout. It is
+//                     now a normal 1200x900 frame parked off-screen. And success is no longer
+//                     inferred solely from the frame reloading: the record's own u_substate
+//                     is polled, so a save that lands without a navigation still counts.
+//                     Failures now say which thing went wrong rather than sharing one
+//                     message — a confirmation dialog waiting on a human, the form refusing
+//                     to save (quoting it), a button that never appeared, or one that stayed
+//                     disabled — and the button is waited for rather than checked once at
+//                     800ms, which called a slow form a missing button.
+//                     __ackMonitorDebug.ackDebug() replays the whole thing with the frame
+//                     on screen and a step trace in the console.
 // @changelog    0.13 - The status pill now carries the running version, read from the script's
 //                     own metadata rather than typed in, so it can't drift from @version. Two
 //                     reasons it earns its place now that the script auto-updates from GitHub:
@@ -115,6 +131,13 @@
         // an Impact somebody has already judged is never overwritten. 3 = Low, i.e.
         // the least presumptuous value; whoever works the ticket can raise it.
         ACK_FALLBACK_IMPACT: '3',
+        // How long the whole acknowledge attempt may take, how long to keep looking
+        // for the Acknowledge button while the form finishes rendering, and how often
+        // to ask the server whether the acknowledge has landed. The first is generous
+        // because a real ServiceNow form on a loaded instance is not quick.
+        ACK_TIMEOUT_MS: 25000,
+        ACK_BUTTON_WAIT_MS: 8000,
+        ACK_WATCH_MS: 1200,
         POLL_MS: 15000,
         COUNTDOWN_SECONDS: 120,
         ACKED_LIFETIME_MS: 5 * 60 * 1000,
@@ -343,74 +366,193 @@
     // (assignRecord's PATCH to assigned_to above is a *different* field and is
     // permitted, which is why that half can stay a clean API call.)
     // Do not "simplify" this into a single PATCH — it will fail silently in prod.
-    function acknowledgeViaHiddenIframe(table, sysId, timeoutMs = 15000) {
+    //
+    // Success used to be defined as "the frame fired a second load event", i.e. the
+    // form submitted and reloaded. That signal is real but it is not the only way an
+    // acknowledge can land, and — worse — its absence covers several different
+    // failures that all surfaced as one unhelpful "timed out" message. So the outcome
+    // is now decided by evidence: the record itself is the authority, and the form is
+    // inspected for the two things that legitimately stop a save.
+    function textOf(el) {
+        return ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
+    }
+
+    // Deliberately getClientRects() and not offsetParent: offsetParent is null for
+    // any position:fixed element, which is precisely what a modal dialog is — so the
+    // obvious check would have been blind to the exact thing it is looking for.
+    function isRendered(el) {
+        return !!el && typeof el.getClientRects === 'function' && el.getClientRects().length > 0;
+    }
+
+    // A ServiceNow confirmation dialog (GlideModal/GlideDialogWindow) renders inside
+    // the same document and waits for a human. In a frame nobody can see, that wait
+    // never ends. Worth checking explicitly: this instance registers a
+    // ShowConfirmUpdateDialog onLoad script, so it is a live possibility here.
+    function findBlockingDialog(doc) {
+        const sel = '.modal, [role="dialog"], #dialog_container, .dialog_body';
+        return Array.from(doc.querySelectorAll(sel))
+            .find(el => isRendered(el) && textOf(el)) || null;
+    }
+
+    // Whatever the form puts up when it refuses to save — a mandatory field it still
+    // wants, an ACL rejection, a client script's own complaint.
+    function formErrors(doc) {
+        const sel = '#output_messages .outputmsg_error, .outputmsg_error, .notification-error, .alert-danger, .form_field_error';
+        return Array.from(doc.querySelectorAll(sel))
+            .filter(isRendered)
+            .map(textOf).filter(Boolean).slice(0, 3);
+    }
+
+    // The one answer the form's DOM cannot fake. u_substate is read-only to us but
+    // perfectly readable, so "did this actually get acknowledged" is a question we
+    // can just ask, instead of inferring it from frame lifecycle events.
+    async function isAckedOnServer(table, sysId) {
+        const notAcked = CONFIG.NOT_ACKED_SUBSTATE[table] ?? '1';
+        try {
+            const r = await snFetch(`/api/now/table/${table}/${sysId}?sysparm_fields=u_substate`);
+            if (!r.ok) return false;
+            const v = (await r.json())?.result?.u_substate;
+            return v !== undefined && v !== null && String(v) !== String(notAcked);
+        } catch {
+            return false; // a read failure is not evidence either way; keep waiting
+        }
+    }
+
+    function acknowledgeViaHiddenIframe(table, sysId, { timeoutMs = CONFIG.ACK_TIMEOUT_MS, visible = false } = {}) {
         return new Promise((resolve, reject) => {
+            const trace = [];
+            const note = msg => { trace.push(msg); console.log(`[ACK Monitor] ack ${sysId}: ${msg}`); };
+
             const iframe = document.createElement('iframe');
-            iframe.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;bottom:0;right:0;';
+            // A real viewport parked off-screen, rather than the 1px opacity:0 frame
+            // this used to use. A zero-area frame lays the form out at 1px wide and is
+            // a prime candidate for Chrome's hidden-frame timer throttling — and
+            // ServiceNow's submit path runs on timers, so the click would land and then
+            // nothing would happen until our own timeout fired.
+            iframe.style.cssText = visible
+                ? 'position:fixed;right:12px;bottom:12px;width:min(560px,90vw);height:70vh;z-index:1000000;border:2px solid #b3261e;border-radius:8px;background:#fff;box-shadow:0 8px 32px rgba(0,0,0,0.3);'
+                : 'position:fixed;left:-20000px;top:0;width:1200px;height:900px;border:0;pointer-events:none;';
             iframe.src = `/${table}.do?sys_id=${sysId}&sysparm_stack=no`;
 
             let settled = false;
             let clicked = false;
+            let watcher = null;
 
-            const timer = setTimeout(() => {
+            function finish(fn, arg) {
                 if (settled) return;
                 settled = true;
-                cleanup();
-                reject(new Error('Timed out waiting for the Acknowledge button/confirmation.'));
-            }, timeoutMs);
-
-            function cleanup() {
                 clearTimeout(timer);
-                setTimeout(() => iframe.remove(), 500);
+                clearInterval(watcher);
+                // A frame opened for debugging stays long enough to be read.
+                setTimeout(() => iframe.remove(), visible ? 30000 : 500);
+                fn(arg);
             }
 
-            function attemptClick(doc) {
-                const btn = findAckButton(doc);
-                if (!btn) {
-                    settled = true;
-                    cleanup();
-                    reject(new Error('Acknowledge button not found — ticket may already be acknowledged.'));
+            function safeDoc() {
+                try { return iframe.contentDocument; } catch { return null; }
+            }
+
+            const timer = setTimeout(async () => {
+                if (settled) return;
+                // A slow save that lands just after the deadline is a success we would
+                // otherwise throw away — and report as a failure on a ticket that is
+                // now acknowledged.
+                if (await isAckedOnServer(table, sysId)) {
+                    note('server confirms acknowledged (arrived late)');
+                    finish(resolve, true);
                     return;
                 }
-                if (btn.disabled) {
-                    settled = true;
-                    cleanup();
-                    reject(new Error('Acknowledge button still disabled after filling mandatory fields — check Impact/Work notes requirements.'));
-                    return;
+                const doc = safeDoc();
+                const dialog = doc && findBlockingDialog(doc);
+                const errors = doc ? formErrors(doc) : [];
+                let why;
+                if (dialog) {
+                    why = `the form is waiting on a dialog ("${textOf(dialog).slice(0, 120)}") that needs a human answer`;
+                } else if (errors.length) {
+                    why = `the form refused to save — ${errors.join(' | ').slice(0, 200)}`;
+                } else if (!clicked) {
+                    why = 'the Acknowledge button never became clickable';
+                } else {
+                    why = 'the Acknowledge button was clicked but the ticket never changed state';
                 }
-                clicked = true;
-                btn.click();
+                finish(reject, new Error(`${why}. Steps: ${trace.join(' → ') || 'none'}. Run __ackMonitorDebug.ackDebug() to watch it happen.`));
+            }, timeoutMs);
+
+            // The form finishes rendering in stages — UI policies, late-loading
+            // includes, batched AJAX that returns after "page loaded". A single check
+            // at a fixed 800ms called a merely slow form a missing button, so keep
+            // looking until the deadline.
+            function waitForButton(doc) {
+                const deadline = Date.now() + CONFIG.ACK_BUTTON_WAIT_MS;
+                const tick = () => {
+                    if (settled) return;
+                    const btn = findAckButton(doc);
+                    if (btn && !btn.disabled) {
+                        note('Acknowledge button found — clicking');
+                        clicked = true;
+                        btn.click();
+                        startWatching(doc);
+                        return;
+                    }
+                    if (Date.now() > deadline) {
+                        finish(reject, new Error(btn
+                            ? 'the Acknowledge button stayed disabled — the form still wants something (Impact / Work notes).'
+                            : 'no Acknowledge button on this form — the ticket may already be acknowledged.'));
+                        return;
+                    }
+                    setTimeout(tick, 300);
+                };
+                setTimeout(tick, 400);
+            }
+
+            // After the click there are three possible worlds: it saved (the record
+            // changes, with or without a navigation), it is blocked on something a
+            // human has to answer, or it was refused. Poll for all three rather than
+            // waiting out the timeout to report one generic failure.
+            function startWatching(doc) {
+                watcher = setInterval(async () => {
+                    if (settled) return;
+                    if (await isAckedOnServer(table, sysId)) {
+                        note('server confirms acknowledged');
+                        finish(resolve, true);
+                        return;
+                    }
+                    const dialog = findBlockingDialog(doc);
+                    if (dialog) {
+                        finish(reject, new Error(`acknowledging opened a dialog that needs a human answer: "${textOf(dialog).slice(0, 160)}"`));
+                        return;
+                    }
+                    const errors = formErrors(doc);
+                    if (errors.length) {
+                        finish(reject, new Error(`the form refused to save — ${errors.join(' | ').slice(0, 200)}`));
+                    }
+                }, CONFIG.ACK_WATCH_MS);
             }
 
             iframe.addEventListener('load', () => {
                 if (settled) return;
+                const doc = safeDoc();
+                if (!doc) { finish(reject, new Error('the ticket form could not be read from the frame.')); return; }
+
+                // The reload after a submit is still the fastest success signal —
+                // it just is not the only one any more.
+                if (clicked) { note('form reloaded after the click'); finish(resolve, true); return; }
+
                 try {
-                    const doc = iframe.contentDocument;
                     // An expired session serves the SSO login page here instead of the
                     // ticket form. Without this it reads as "Acknowledge button not
                     // found — may already be acknowledged", which sends people looking
                     // at the ticket rather than at their session.
-                    if (!clicked && looksLikeLoginPage(doc.documentElement?.innerHTML || '')) {
-                        settled = true;
-                        cleanup();
+                    if (looksLikeLoginPage(doc.documentElement?.innerHTML || '')) {
                         markSessionBroken('ServiceNow served a sign-in page instead of the ticket form.');
-                        reject(new SessionError('The ServiceNow session has expired — sign in again, then Reconnect.'));
+                        finish(reject, new SessionError('The ServiceNow session has expired — sign in again, then Reconnect.'));
                         return;
                     }
-                    if (!clicked) {
-                        fillMandatoryAckFields(doc, table);
-                        // Give the page's own change handlers/validation a moment to
-                        // process before we check the button and click it.
-                        setTimeout(() => { if (!settled) attemptClick(doc); }, 800);
-                    } else {
-                        settled = true;
-                        cleanup();
-                        resolve(true);
-                    }
+                    note('form loaded');
+                    fillMandatoryAckFields(doc, table);
+                    waitForButton(doc);
                 } catch (e) {
-                    settled = true;
-                    cleanup();
-                    reject(new Error('Iframe access error: ' + e.message));
+                    finish(reject, new Error('Iframe access error: ' + e.message));
                 }
             });
 
@@ -418,9 +560,9 @@
         });
     }
 
-    async function acknowledgeTicket(table, sysId, userId) {
+    async function acknowledgeTicket(table, sysId, userId, opts = {}) {
         await assignRecord(table, sysId, userId);
-        await acknowledgeViaHiddenIframe(table, sysId);
+        await acknowledgeViaHiddenIframe(table, sysId, opts);
     }
 
     // ─── CROSS-SITE SYNC (GM storage — shared across every domain the script runs on) ──
@@ -1204,6 +1346,23 @@
                 '| this tab:', TAB_ID, '| wasMe:', !!last && last.tabId === TAB_ID,
                 '| due now:', pollIsDue());
             return last;
+        },
+        // Watch an acknowledge happen. Runs the real flow with the frame on screen and
+        // a step-by-step trace in the console — the only way to see which step a
+        // stubborn instance stops at, since the whole thing normally happens off-screen.
+        // Call with no arguments to use the ticket currently alerting.
+        ackDebug(sysId) {
+            if (!IS_SNOW_HOST) { console.warn('[ACK Monitor] ackDebug only works on a SNOW tab.'); return; }
+            const state = getState();
+            const entry = sysId ? state[sysId] : Object.values(state).find(e => e.status === 'pending');
+            if (!entry || !entry.ticket) {
+                console.warn('[ACK Monitor] no pending ticket to debug — pass a sys_id, e.g. ackDebug("abc123…").');
+                return;
+            }
+            console.log(`[ACK Monitor] ackDebug on ${entry.ticket.number} (${entry.ticket.sys_id}) — the frame stays on screen for 30s.`);
+            return acknowledgeViaHiddenIframe(entry.ticket.table, entry.ticket.sys_id, { visible: true, timeoutMs: 60000 })
+                .then(() => console.log('[ACK Monitor] ackDebug: acknowledged.'))
+                .catch(e => console.error('[ACK Monitor] ackDebug failed:', e.message));
         },
         // Auth triage: if a credential prompt ever comes back, check here first —
         // a null token is the cause, not a symptom.
