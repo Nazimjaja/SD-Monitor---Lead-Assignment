@@ -1,8 +1,26 @@
 // ==UserScript==
 // @name         SD Monitor - Live Acknowledge Popup
 // @namespace    geodis-sd-monitor
-// @version      0.10
+// @version      0.11
 // @description  Cross-site synced live alert for unacknowledged tickets; full function on ServiceNow, mirrored popups elsewhere
+// @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
+// @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.js
+// @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.js
+// @changelog    0.11 - Authentication fix, the same one the assignment dashboard took in its 0.5:
+//                     the browser no longer prompts for credentials. Requests ride the SSO session
+//                     cookies as before, but they now also carry the session token (g_ck) that
+//                     ServiceNow requires alongside the cookie — the poll sent none at all and the
+//                     assign PATCH sent `g_ck || ''`, and SNOW answers a failed token check with
+//                     401 + WWW-Authenticate: BASIC, which is what raised the browser's native
+//                     login box. The token is read from every place g_ck lives (UI16 global, Next
+//                     Experience, sysparm_ck field) and scraped from a page as a last resort,
+//                     rather than degrading to ''. An expired session is now recognised — both the
+//                     401 and the SSO redirect to a login page, which used to arrive as a 200 full
+//                     of HTML and surface as a JSON parse error — and the tab stands down from
+//                     polling instead of re-provoking the prompt every 15s, showing a Reconnect
+//                     button on the status pill instead. A tab in that state declines its turn
+//                     without staking the poll claim, so healthy tabs still poll for everyone.
+//                     Script now carries its GitHub @updateURL, so Tampermonkey can self-update.
 // @changelog    0.10 - Polling is now shared across SNOW tabs instead of every open SNOW
 //                     tab polling independently (N tabs = N× the API load). Rather than
 //                     electing a leader, GM storage tracks when the last poll happened and
@@ -89,25 +107,166 @@
         SOUND_ENABLED: true
     };
 
+    // ─── SESSION / AUTHENTICATION (SNOW pages only) ─────────────────────────
+    // Everything here rides the browser's existing SSO session — we never ask for
+    // credentials and never send an Authorization header. But a session cookie on its
+    // own is NOT enough: ServiceNow rejects a session-authenticated API call that
+    // arrives without the session token (g_ck) in X-UserToken, and it answers that
+    // rejection with "401 + WWW-Authenticate: BASIC". That header is what makes the
+    // browser throw up its native username/password dialog — a box no SSO login can
+    // ever satisfy. So a missing token doesn't fail quietly, it pops a credential
+    // prompt, and a poll on a timer re-provokes it every cycle forever.
+    //
+    // Two rules follow, and every request below obeys them:
+    //   1. Always send a real token. Never send an empty one — SNOW treats
+    //      X-UserToken: '' as a *failed* token check, which is worse than anonymous.
+    //      (`g_ck || ''` was exactly that, and was the bug.)
+    //   2. On the first genuine auth failure, stand down. One dialog is a bug report;
+    //      one dialog every POLL_MS is unusable.
+    class SessionError extends Error {
+        constructor(message) { super(message); this.name = 'SessionError'; }
+    }
+
+    let sessionToken = null;
+    let sessionTokenPromise = null;
+    let sessionBroken = false;
+
+    // Where g_ck lives depends on which UI you're on: a global in UI16, hung off the
+    // NOW namespace in Next Experience, and in a hidden form field on plain .do pages.
+    // Checking all of them is why this no longer silently degrades to an empty token.
+    function tokenFromPageWindow() {
+        const w = pageWindow;
+        const field = document.querySelector('input[name="sysparm_ck"]');
+        const candidates = [
+            w.g_ck,
+            w.NOW && w.NOW.g_ck,
+            w.NOW && w.NOW.session && w.NOW.session.token,
+            w.g_sysparm_ck,
+            field && field.value
+        ];
+        return candidates.find(v => typeof v === 'string' && v.length >= 32) || null;
+    }
+
+    // Fallback for UIs that expose g_ck nowhere reachable: scrape it out of a page
+    // fetched with the session cookies. Deliberately a bare fetch — it must not route
+    // through snFetch, which would need a token to run and recurse.
+    async function tokenFromBlankPage() {
+        const r = await fetch('/blank.do', { credentials: 'same-origin', cache: 'no-store' });
+        if (!r.ok) return null;
+        const text = await r.text();
+        const m = /(?:var\s+g_ck\s*=|["']g_ck["']\s*:)\s*["']([^"']{32,})["']/.exec(text);
+        return m ? m[1] : null;
+    }
+
+    async function getSessionToken(forceRefresh = false) {
+        // A mirror tab has no SNOW session and no /blank.do to scrape — it relays ack
+        // requests to a SNOW tab instead, so there is nothing to fetch here.
+        if (!IS_SNOW_HOST) return null;
+        if (sessionToken && !forceRefresh) return sessionToken;
+        const direct = tokenFromPageWindow();
+        if (direct) { sessionToken = direct; return sessionToken; }
+        if (!sessionTokenPromise) {
+            sessionTokenPromise = tokenFromBlankPage()
+                .catch(() => null)
+                .then(t => { sessionToken = t; return t; })
+                .finally(() => { sessionTokenPromise = null; });
+        }
+        return sessionTokenPromise;
+    }
+
+    // A dead SSO session usually arrives as a redirect to the IdP rather than a 401,
+    // which means a 200 carrying HTML. Without this the response reaches r.json() and
+    // surfaces as an unexplained "Unexpected token <" instead of "sign in again".
+    function looksLikeLoginPage(text) {
+        return /<form[^>]+login\.do/i.test(text)
+            || /name=["']sysparm_login/i.test(text)
+            || /SAMLRequest/i.test(text)
+            || /<title>[^<]*(sign in|log ?in)/i.test(text);
+    }
+
+    function markSessionBroken(reason) {
+        if (sessionBroken) return;
+        sessionBroken = true;
+        sessionToken = null;
+        // No interval to clear: polling is the shared cross-tab tick, and pollCycle
+        // checks sessionBroken before volunteering. Standing down there rather than
+        // here is deliberate — this tab declines the round *without* staking the
+        // claim, so a healthy tab still takes it and everyone keeps getting alerts.
+        showSessionBanner(reason);
+    }
+
+    // Single funnel for every ServiceNow call, so the cookie/token/redirect handling
+    // can't drift apart between the read and write paths.
+    async function snFetch(path, { method = 'GET', body = null, headers = {} } = {}) {
+        if (sessionBroken) {
+            throw new SessionError('Paused — the ServiceNow session needs re-authenticating.');
+        }
+
+        const send = token => {
+            const h = Object.assign({
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                // Ask SNOW to answer an expired session with a 401 body instead of
+                // 302-ing us into the SSO login flow. Following that redirect chain is
+                // both how we ended up parsing HTML as JSON and an extra opportunity
+                // for an auth challenge to reach the browser.
+                'X-No-Response-Redirect': 'true'
+            }, headers);
+            if (token) h['X-UserToken'] = token; // rule 1: never an empty token
+            return fetch(path, {
+                method,
+                headers: h,
+                body,
+                // The SSO session cookies are the entire authentication story here.
+                // fetch() already defaults to same-origin, but state it so nobody
+                // "tidies" this into a credential-less request later.
+                credentials: 'same-origin',
+                cache: 'no-store',
+                redirect: 'follow'
+            });
+        };
+
+        const token = await getSessionToken();
+        let r = await send(token);
+
+        // A rejected token is recoverable — the page may have been open across a
+        // session renewal — so re-read g_ck and retry exactly once. A second failure
+        // means the session itself is gone, and retrying on a timer from there is what
+        // produced a credential dialog every few seconds.
+        if (r.status === 401 || r.status === 403) {
+            const fresh = await getSessionToken(true);
+            if (fresh && fresh !== token) r = await send(fresh);
+        }
+        if (r.status === 401 || r.status === 403 || r.headers.get('X-Is-Logged-In') === 'false') {
+            markSessionBroken(`ServiceNow rejected the request (HTTP ${r.status}).`);
+            throw new SessionError('Not signed in to ServiceNow, or the session token is no longer valid.');
+        }
+
+        if (r.ok && !/json/i.test(r.headers.get('content-type') || '')) {
+            const text = await r.text();
+            if (looksLikeLoginPage(text)) {
+                markSessionBroken('ServiceNow answered with a sign-in page.');
+                throw new SessionError('The ServiceNow session has expired — SSO returned its login page.');
+            }
+            throw new Error(`Expected JSON from ${path}, got ${r.headers.get('content-type') || 'no content-type'}.`);
+        }
+        return r;
+    }
+
     // ─── SNOW HELPERS (only meaningfully used when IS_SNOW_HOST) ───────────
-    function getCsrfToken() { return pageWindow.g_ck || ''; }
     function getMyId()      { return pageWindow.NOW?.user?.userID || pageWindow.g_user_id || ''; }
     function getMyName()    { return pageWindow.NOW?.user?.fullName || pageWindow.g_user_name || 'You'; }
 
     async function jFetch(table, query, limit = 20) {
-        const r = await fetch(`/${table}_list.do?JSONv2&sysparm_action=getRecords&sysparm_query=${query}&sysparm_limit=${limit}`);
+        const r = await snFetch(`/${table}_list.do?JSONv2&sysparm_action=getRecords&sysparm_query=${query}&sysparm_limit=${limit}`);
         if (!r.ok) throw new Error(`${table}: HTTP ${r.status}`);
         return (await r.json()).records || [];
     }
 
     async function assignRecord(table, sysId, userId) {
-        const r = await fetch(`/api/now/table/${table}/${sysId}`, {
+        const r = await snFetch(`/api/now/table/${table}/${sysId}`, {
             method: 'PATCH',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'X-UserToken': getCsrfToken()
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ assigned_to: userId })
         });
         if (!r.ok) throw new Error(`HTTP ${r.status} — ${(await r.text()).slice(0, 120)}`);
@@ -193,6 +352,17 @@
                 if (settled) return;
                 try {
                     const doc = iframe.contentDocument;
+                    // An expired session serves the SSO login page here instead of the
+                    // ticket form. Without this it reads as "Acknowledge button not
+                    // found — may already be acknowledged", which sends people looking
+                    // at the ticket rather than at their session.
+                    if (!clicked && looksLikeLoginPage(doc.documentElement?.innerHTML || '')) {
+                        settled = true;
+                        cleanup();
+                        markSessionBroken('ServiceNow served a sign-in page instead of the ticket form.');
+                        reject(new SessionError('The ServiceNow session has expired — sign in again, then Reconnect.'));
+                        return;
+                    }
                     if (!clicked) {
                         fillMandatoryAckFields(doc, table);
                         // Give the page's own change handlers/validation a moment to
@@ -341,7 +511,10 @@
         } else if (event.type === 'TICKET_REMOVED') {
             knownPendingSysIds.delete(event.sys_id);
             removePopup(event.sys_id, { updateState: false }); // publisher already updated state
-        } else if (event.type === 'ACK_REQUEST' && IS_SNOW_HOST) {
+        } else if (event.type === 'ACK_REQUEST' && IS_SNOW_HOST && !sessionBroken) {
+            // Same reasoning as the poll: a tab with a rejected session must not claim
+            // work, because claiming it makes every other SNOW tab stand down and the
+            // ack would then fail here. Declining lets a signed-in tab take it.
             claimAckRequest(event._id).then(won => {
                 if (won) fulfillAckRequest(event.ticket, event._id);
             });
@@ -475,6 +648,23 @@
             margin: 0 !important;
         }
         #sdmStatusIndicator.sdmErrorState .sdmDot { background: #e5484d !important; animation: none !important; }
+        #sdmStatusIndicator .sdmReconnectBtn {
+            display: none !important;
+            border: none !important;
+            border-radius: 10px !important;
+            background: #b3261e !important;
+            color: #fff !important;
+            font-family: inherit !important;
+            font-size: 10.5px !important;
+            line-height: normal !important;
+            padding: 3px 9px !important;
+            margin: 0 0 0 2px !important;
+            cursor: pointer !important;
+            box-shadow: none !important;
+            flex: 0 0 auto !important;
+        }
+        #sdmStatusIndicator.sdmSessionLost .sdmReconnectBtn { display: inline-block !important; }
+        #sdmStatusIndicator .sdmReconnectBtn:disabled { opacity: 0.5 !important; cursor: default !important; }
         @keyframes sdmPulse {
             0%   { box-shadow: 0 0 0 0 rgba(46,158,91,0.4); }
             70%  { box-shadow: 0 0 0 6px rgba(46,158,91,0); }
@@ -485,18 +675,54 @@
     // ─── STATUS INDICATOR — SNOW pages only ─────────────────────────────────
     let statusTextEl = null;
     let statusEl = null;
+    let reconnectBtn = null;
     if (IS_SNOW_HOST) {
         statusEl = document.createElement('div');
         statusEl.id = 'sdmStatusIndicator';
-        statusEl.innerHTML = `<span class="sdmDot"></span><span class="sdmStatusText">ACK Monitor loaded</span>`;
+        statusEl.innerHTML = `<span class="sdmDot"></span><span class="sdmStatusText">ACK Monitor loaded</span>`
+            + `<button class="sdmReconnectBtn" type="button">Reconnect</button>`;
         document.body.appendChild(statusEl);
         statusTextEl = statusEl.querySelector('.sdmStatusText');
+        reconnectBtn = statusEl.querySelector('.sdmReconnectBtn');
+        reconnectBtn.addEventListener('click', reconnectSession);
     }
 
     function setStatus(text, isError = false) {
         if (!statusEl) return; // no-op on non-SNOW pages
         statusTextEl.textContent = text;
         statusEl.classList.toggle('sdmErrorState', isError);
+    }
+
+    // ─── SESSION BANNER + RECONNECT ─────────────────────────────────────────
+    // The status pill is the only chrome this script owns on a SNOW page, so it
+    // doubles as the "you are signed out" banner. It has to be actionable: the poll
+    // has stood down and nothing will restart it on its own — that standing down is
+    // the actual fix for the credential dialog, since every further request would
+    // re-provoke the browser's native login box.
+    function showSessionBanner(reason) {
+        if (statusEl) statusEl.classList.add('sdmSessionLost');
+        setStatus('ACK Monitor — signed out, alerts paused', true);
+        console.warn('[ACK Monitor] session lost:', reason);
+    }
+
+    async function reconnectSession() {
+        if (reconnectBtn) { reconnectBtn.disabled = true; reconnectBtn.textContent = '…'; }
+        // Clear the flag first so snFetch is allowed to try again, and drop the cached
+        // token so we re-read it rather than replaying the one that was just rejected.
+        sessionBroken = false;
+        sessionToken = null;
+        setStatus('ACK Monitor — reconnecting…');
+        try {
+            const token = await getSessionToken(true);
+            if (!token) throw new Error('Could not read the ServiceNow session token (g_ck) — the SSO session looks gone.');
+            if (statusEl) statusEl.classList.remove('sdmSessionLost');
+            await pollMyUnacknowledged();
+            markPolled(); // rejoin the shared rhythm rather than leaving a poll overdue
+        } catch (e) {
+            markSessionBroken(e.message);
+        } finally {
+            if (reconnectBtn) { reconnectBtn.disabled = false; reconnectBtn.textContent = 'Reconnect'; }
+        }
     }
 
     // ─── ALERT SOUND — synthesized, no external file needed ────────────────
@@ -756,6 +982,10 @@
                 tickets.forEach(t => { t._table = table; });
                 allTickets = allTickets.concat(tickets);
             } catch (e) {
+                // A dead session isn't a per-table hiccup to log and carry on from:
+                // the next table would just re-provoke the auth challenge. The banner
+                // is already up, so abandon the whole round.
+                if (e instanceof SessionError) return;
                 setStatus(`ACK Monitor — poll error (${table})`, true);
                 console.error(`[ACK Monitor] poll failed for ${table}`, e);
             }
@@ -861,6 +1091,12 @@
         // tab) — and because staking the claim makes every *other* tab stand down, a
         // tab that then bails out would silently suppress polling everywhere. Sharing
         // the work means a broken tab has to decline the round, not consume it.
+        //
+        // A tab whose session was rejected declines for the same reason, and gets its
+        // own branch because the consequence differs: polling on from here is what
+        // re-opened the browser's credential dialog every POLL_MS. It waits for a
+        // human to hit Reconnect; meanwhile any healthy tab keeps alerting for us all.
+        if (sessionBroken) return;
         if (!getMyId()) {
             setStatus('ACK Monitor — no user ID on this page', true);
             return;
@@ -882,6 +1118,14 @@
     }
 
     if (IS_SNOW_HOST) {
+        // Warm the session token before the first request goes out, so the opening
+        // poll can't be the thing that provokes a credential prompt. Deliberately not
+        // awaited around the tick below — a slow /blank.do scrape shouldn't delay the
+        // schedule, and snFetch awaits the same cached promise anyway.
+        getSessionToken().then(token => {
+            if (!token) markSessionBroken('No ServiceNow session token found on this page.');
+        });
+
         // The tick is much shorter than POLL_MS: it's just "is a poll overdue?", and a
         // fast tick is what keeps takeover from a dead tab prompt.
         setInterval(pollCycle, CONFIG.POLL_TICK_MS);
@@ -911,6 +1155,11 @@
                 '| this tab:', TAB_ID, '| wasMe:', !!last && last.tabId === TAB_ID,
                 '| due now:', pollIsDue());
             return last;
-        }
+        },
+        // Auth triage: if a credential prompt ever comes back, check here first —
+        // a null token is the cause, not a symptom.
+        session() { return { token: sessionToken, broken: sessionBroken, snowHost: IS_SNOW_HOST }; },
+        refreshToken() { return getSessionToken(true); },
+        reconnect: reconnectSession
     };
 })();
