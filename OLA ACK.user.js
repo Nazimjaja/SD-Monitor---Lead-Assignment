@@ -4,8 +4,8 @@
 // @version      0.12
 // @description  Cross-site synced live alert for unacknowledged tickets; full function on ServiceNow, mirrored popups elsewhere
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
-// @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.js
-// @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.js
+// @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
+// @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
 // @changelog    0.12 - Acknowledging an incident no longer overwrites an Impact somebody had
 //                     already set. The mandatory-field step filled Impact whenever it wasn't
 //                     already 3-Low, but clicking Acknowledge submits the whole form, so that
