@@ -1,11 +1,14 @@
 'use strict';
-// Covers what the agent actually sees: the popup in each of its states, in both
-// colour schemes. Screenshots land in tests/.screenshots/ (git-ignored) so a visual
-// change can be eyeballed; the assertions below are what makes it a test.
+// Covers what the agent actually sees: the popup in each of its states. Screenshots
+// land in tests/.screenshots/ (git-ignored) so a visual change can be eyeballed; the
+// assertions below are what makes it a test.
+//
+// The popup is deliberately light-only, so it runs under a dark OS preference too —
+// not to check a dark theme, but to prove none appears.
 
 const path = require('path');
 const fs = require('fs');
-const { loadPlaywright, json, startSnowPage, createResults, SNOW_ORIGIN } = require('./harness');
+const { loadPlaywright, json, html, startSnowPage, createResults, SNOW_ORIGIN } = require('./harness');
 
 const SHOT_DIR = path.join(__dirname, '.screenshots');
 
@@ -43,6 +46,7 @@ async function run() {
     fs.mkdirSync(SHOT_DIR, { recursive: true });
 
     for (const scheme of ['light', 'dark']) {
+        // `scheme` here is what the OS is asking for, not what the popup should be.
         const page = await startSnowPage(browser, {
             colorScheme: scheme,
             version: '0.0-test',
@@ -73,6 +77,31 @@ async function run() {
         r.check(`[${scheme}] the version badge is on the status pill`,
             (await page.locator('#sdmStatusIndicator .sdmVer').textContent()) === 'v0.0-test');
 
+        // #0f172a — the popup stays light even when the OS asks for dark.
+        const inkColour = await page.locator('.sdmPopup .sdmNum').first().evaluate(el => getComputedStyle(el).color);
+        r.check(`[OS ${scheme}] popup stays on the light theme`, inkColour === 'rgb(15, 23, 42)', inkColour);
+
+        // A page that scales its content used to scale the card with it, which is why
+        // the same popup came out bigger on a ticket form than on a list.
+        const width = await page.locator('.sdmPopup').first().evaluate(el => el.getBoundingClientRect().width);
+        r.check(`[OS ${scheme}] card is exactly the configured width`, Math.round(width) === 300, `${Math.round(width)}px`);
+
+        await page.close();
+    }
+
+    // The reported bug, reproduced: a page that scales its own content used to scale
+    // the fixed-position card with it, so the same popup came out visibly larger on a
+    // ticket form than on a list view.
+    for (const zoom of ['1.25', '0.85']) {
+        const page = await startSnowPage(browser, {
+            version: '0.0-test',
+            handler: url => (/_list\.do$/.test(url.pathname)
+                ? json({ records: [] })
+                : html(`<html><body style="zoom:${zoom}">scaled page</body></html>`))
+        });
+        await showAll(page);
+        const width = await page.locator('.sdmPopup').first().evaluate(el => el.getBoundingClientRect().width);
+        r.check(`a page zoomed to ${zoom} still renders a 300px card`, Math.abs(width - 300) < 2, `${width.toFixed(1)}px`);
         await page.close();
     }
 

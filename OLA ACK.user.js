@@ -1,11 +1,24 @@
 // ==UserScript==
 // @name         SD Monitor - Live Acknowledge Popup
 // @namespace    geodis-sd-monitor
-// @version      0.16
+// @version      0.17
 // @description  Cross-site synced live alert for unacknowledged tickets; full function on ServiceNow, mirrored popups elsewhere
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
+// @changelog    0.17 - Dark mode is gone: the popup is light on every page, whatever the OS
+//                     theme says, and pins color-scheme so no browser dark styling leaks
+//                     into its controls.
+//                     Fixed the popup coming out larger on some pages than others. Every
+//                     dimension here is a fixed pixel value, but a host page that scales its
+//                     own content — a zoom or a transform on an ancestor, which some
+//                     ServiceNow form views apply — scales our fixed-position card with it.
+//                     A probe of known width is measured once per page and the popups are
+//                     given the inverse, so the card is the same size on a ticket form as on
+//                     a list. Browser zoom deliberately does not trigger this: it scales the
+//                     viewport too, so the popup keeps matching the rest of the page, which
+//                     is what someone zooming wants. __ackMonitorDebug.pageScale() reports
+//                     what a page is doing and what the card actually measures.
 // @changelog    0.16 - Popup redesigned again, to the compact layout with the countdown as
 //                     the card's bottom edge. It loses a whole line by putting the clock on
 //                     the header row beside the ticket number, and the remaining time reads
@@ -818,22 +831,25 @@
             line-height: 1.4 !important;
             text-align: left !important;
             color: var(--sdm-text) !important;
+            color-scheme: light !important;
             z-index: 999999 !important;
+            transform: scale(var(--sdm-scale, 1)) !important;
+            transform-origin: top right !important;
             transition: top 0.32s cubic-bezier(0.22,1,0.36,1), box-shadow 0.2s ease, transform 0.2s ease !important;
             animation: sdmEnter 420ms cubic-bezier(0.22,1,0.36,1) backwards !important;
         }
         /* backwards, not both: once the entrance has played the element goes back to
            its normal styles, which is what lets :hover move it at all. */
         @keyframes sdmEnter {
-            from { opacity: 0; transform: translateX(26px) scale(0.965); }
-            to   { opacity: 1; transform: none; }
+            from { opacity: 0; transform: translateX(26px) scale(calc(var(--sdm-scale, 1) * 0.965)); }
+            to   { opacity: 1; transform: scale(var(--sdm-scale, 1)); }
         }
         @keyframes sdmLeave {
-            to { opacity: 0; transform: translateX(18px) scale(0.97); }
+            to { opacity: 0; transform: translateX(18px) scale(calc(var(--sdm-scale, 1) * 0.97)); }
         }
         .sdmPopup.sdmLeaving { animation: sdmLeave 200ms ease forwards !important; pointer-events: none !important; }
         .sdmPopup:hover {
-            transform: translateY(-1px) !important;
+            transform: translateY(-1px) scale(var(--sdm-scale, 1)) !important;
             box-shadow:
                 0 1px 2px rgba(15,23,42,0.06),
                 0 10px 18px -6px rgba(15,23,42,0.14),
@@ -849,26 +865,6 @@
             background-image: linear-gradient(180deg, var(--sdm-accent-soft), var(--sdm-accent)) !important;
             box-shadow: 0 0 10px -1px var(--sdm-accent-glow) !important;
         }
-        @media (prefers-color-scheme: dark) {
-            .sdmPopup {
-                --sdm-surface-a: rgba(30,37,48,0.97);
-                --sdm-surface-b: rgba(20,25,33,0.97);
-                --sdm-border: rgba(255,255,255,0.10);
-                --sdm-highlight: rgba(255,255,255,0.07);
-                --sdm-text: #e8ecf2;
-                --sdm-muted: #98a3b3;
-                --sdm-btn-a: #f1f5f9;
-                --sdm-btn-b: #dbe2ea;
-                --sdm-btn-text: #0f172a;
-                --sdm-hairline: rgba(255,255,255,0.16);
-                --sdm-track: rgba(255,255,255,0.10);
-                box-shadow:
-                    0 1px 2px rgba(0,0,0,0.35),
-                    0 8px 18px -6px rgba(0,0,0,0.5),
-                    0 24px 44px -18px rgba(0,0,0,0.65),
-                    inset 0 1px 0 var(--sdm-highlight) !important;
-            }
-        }
         /* Urgency owns the accent -- everything here is inside an SLA countdown, so a
            P4 does not get to look calm. Priority colours its own chip instead. */
         .sdmPopup.sdmP1 { --sdm-prio-a: #ef4444; --sdm-prio-b: #b91c1c; }
@@ -877,9 +873,6 @@
         .sdmPopup.sdmAcked {
             --sdm-accent: #059669; --sdm-accent-soft: #34d399; --sdm-accent-glow: rgba(5,150,105,0.30);
             --sdm-surface-a: rgba(240,253,248,0.99); --sdm-surface-b: rgba(248,252,250,0.99);
-        }
-        @media (prefers-color-scheme: dark) {
-            .sdmPopup.sdmAcked { --sdm-surface-a: rgba(22,42,36,0.97); --sdm-surface-b: rgba(18,28,26,0.97); }
         }
         /* Under 30s the whole card is lit, not just the digits -- peripheral vision
            reads a change in the object long before it reads four characters. */
@@ -1033,15 +1026,6 @@
             align-items: center !important;
             gap: 6px !important;
             user-select: none !important;
-        }
-        @media (prefers-color-scheme: dark) {
-            #sdmStatusIndicator {
-                background: rgba(21,26,33,0.85) !important;
-                border-color: rgba(255,255,255,0.12) !important;
-                color: rgba(230,233,239,0.8) !important;
-                box-shadow: 0 4px 16px rgba(0,0,0,0.5) !important;
-            }
-            #sdmStatusIndicator .sdmVer { color: rgba(230,233,239,0.55) !important; background: rgba(255,255,255,0.1) !important; }
         }
         #sdmStatusIndicator .sdmDot {
             width: 7px !important; height: 7px !important; border-radius: 50% !important;
@@ -1212,6 +1196,38 @@
 
     // ─── POPUP STACKING (runs on every page — mirrors included) ─────────────
     const popupsBySysId = new Map();
+
+    // A host page that scales its own content — a `zoom` on an ancestor, or a
+    // transform, both of which some ServiceNow form views apply — scales our
+    // fixed-position card along with it. That is why the same popup can come out
+    // visibly larger on a ticket form than on a list view, despite every dimension
+    // here being a fixed pixel value.
+    //
+    // Measure a probe of known width once and hand the popups the inverse. Browser
+    // zoom (Ctrl +) deliberately does not trigger this: it scales the viewport too,
+    // so the probe still measures 100 and the popup keeps matching the rest of the
+    // page, which is what someone zooming actually wants.
+    let pageScale = null;
+    function getPageScale() {
+        if (pageScale !== null) return pageScale;
+        try {
+            const probe = document.createElement('div');
+            probe.style.cssText = 'position:fixed;left:-9999px;top:0;width:100px;height:1px;pointer-events:none;visibility:hidden;';
+            document.body.appendChild(probe);
+            const measured = probe.getBoundingClientRect().width;
+            probe.remove();
+            const ratio = measured / 100;
+            // Ignore the implausible: a wild ratio means the measurement is wrong,
+            // and scaling by a wrong number is worse than not scaling at all.
+            pageScale = (ratio > 0.5 && ratio < 3 && Math.abs(ratio - 1) > 0.02) ? 1 / ratio : 1;
+            if (pageScale !== 1) {
+                console.log(`[ACK Monitor] this page scales its content by ${ratio.toFixed(3)}x — compensating so the popup stays ${CONFIG.POPUP_WIDTH}px.`);
+            }
+        } catch {
+            pageScale = 1;
+        }
+        return pageScale;
+    }
 
     // A mirror tab has no ServiceNow origin of its own, so the ticket carries the one
     // it was found on. Shared by the pending and acknowledged states.
@@ -1392,6 +1408,8 @@
         errorEl.style.display = 'none';
 
         popup.append(head, desc, actions, errorEl, track);
+        const scale = getPageScale();
+        if (scale !== 1) popup.style.setProperty('--sdm-scale', String(scale));
         document.body.appendChild(popup);
         popupsBySysId.set(ticket.sys_id, popup);
         if (playSound) playAlertSound();
@@ -1689,6 +1707,18 @@
                 '| this tab:', TAB_ID, '| wasMe:', !!last && last.tabId === TAB_ID,
                 '| due now:', pollIsDue());
             return last;
+        },
+        // Answers "is this page making the popup a different size?" — 1 means the page
+        // is not scaling anything and the card is exactly CONFIG.POPUP_WIDTH wide.
+        pageScale() {
+            const compensation = getPageScale();
+            const el = document.querySelector('.sdmPopup');
+            return {
+                pageScales: +(1 / compensation).toFixed(3),
+                compensation: +compensation.toFixed(3),
+                renderedWidth: el ? Math.round(el.getBoundingClientRect().width) : null,
+                expected: CONFIG.POPUP_WIDTH
+            };
         },
         // Sound triage: state 'running' means the browser is letting us play. A
         // 'suspended' that survives a click on the page is the autoplay policy, not
