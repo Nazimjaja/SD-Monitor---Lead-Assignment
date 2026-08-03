@@ -1,11 +1,16 @@
 // ==UserScript==
 // @name         SD Monitor - Live Acknowledge Popup
 // @namespace    geodis-sd-monitor
-// @version      0.17
+// @version      0.18
 // @description  Cross-site synced live alert for unacknowledged tickets; full function on ServiceNow, mirrored popups elsewhere
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
+// @changelog    0.18 - The Acknowledge button is green rather than near-black. On a card whose
+//                     accent is the red of a running deadline, a dark neutral button read as
+//                     chrome; green makes the two colours mean different things — the clock
+//                     pressing, and the way out of it. A deeper emerald than the obvious one,
+//                     so the white label stays legible at 11.5px.
 // @changelog    0.17 - Dark mode is gone: the popup is light on every page, whatever the OS
 //                     theme says, and pins color-scheme so no browser dark styling leaks
 //                     into its controls.
@@ -803,8 +808,12 @@
             --sdm-accent-glow: rgba(225,29,72,0.30);
             --sdm-prio-a: #64748b;
             --sdm-prio-b: #475569;
-            --sdm-btn-a: #1e293b;
-            --sdm-btn-b: #0f172a;
+            /* Green for the action, red for the clock: the two colours on the card
+               now mean different things — the deadline pressing, and the way out of
+               it. Deeper than a mid emerald on purpose, so white label text stays
+               legible at 11.5px rather than sitting on a bright fill. */
+            --sdm-btn-a: #059669;
+            --sdm-btn-b: #047857;
             --sdm-btn-text: #ffffff;
             --sdm-hairline: rgba(15,23,42,0.13);
             --sdm-track: rgba(15,23,42,0.07);
