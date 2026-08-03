@@ -1,11 +1,21 @@
 // ==UserScript==
 // @name         SD Monitor - Live Acknowledge Popup
 // @namespace    geodis-sd-monitor
-// @version      0.18
+// @version      0.19
 // @description  Cross-site synced live alert for unacknowledged tickets; full function on ServiceNow, mirrored popups elsewhere
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
+// @changelog    0.19 - The red rail down the left edge of the popup is gone — it fought with
+//                     the countdown bar for the same job and only made the card look
+//                     lopsided. Urgency is still carried by the clock, the bottom bar and
+//                     the breathing glow.
+//                     The card is real glass now: a translucent fill over a wide backdrop
+//                     blur, with a diagonal sheen across the top-left. Because a blur does
+//                     nothing over a white page, the card never leans on it for its edges —
+//                     the hairline border, the sheen and the layered shadow are what keep it
+//                     legible on a plain white background. Browsers without backdrop-filter
+//                     fall back to the old solid surface.
 // @changelog    0.18 - The Acknowledge button is green rather than near-black. On a card whose
 //                     accent is the red of a running deadline, a dark neutral button read as
 //                     chrome; green makes the two colours mean different things — the clock
@@ -790,19 +800,21 @@
         .sdmPopup, .sdmPopup * {
             box-sizing: border-box !important;
         }
-        /* Depth is built from layers, not from one blur: a near-opaque surface with a
-           faint vertical gradient, a hairline border, an inset top highlight for the
-           lit edge, and a shadow in four steps from contact to ambient. The blur is
-           kept low and sits under an almost-solid fill, so it reads as depth against
-           a ServiceNow list rather than as frosted glass over it. Every variant --
-           priority, urgency, acknowledged -- moves custom properties, not rules. */
+        /* Real glass, not a white box: a translucent fill over a wide blur, so what is
+           behind the card shows through as colour and movement. The catch with glass
+           is that it disappears on a white page -- blurring white gives you white --
+           so the card is never allowed to depend on the blur for its edges. Definition
+           comes from things that survive any backdrop: a dark hairline border, a
+           diagonal specular sheen across the top-left, and a shadow in four steps from
+           contact to ambient. Every variant -- priority, urgency, acknowledged -- moves
+           custom properties, not rules. */
         .sdmPopup {
-            --sdm-surface-a: rgba(255,255,255,0.99);
-            --sdm-surface-b: rgba(248,250,252,0.99);
-            --sdm-border: rgba(15,23,42,0.09);
-            --sdm-highlight: rgba(255,255,255,0.95);
+            --sdm-surface-a: rgba(255,255,255,0.72);
+            --sdm-surface-b: rgba(241,245,249,0.58);
+            --sdm-border: rgba(15,23,42,0.14);
+            --sdm-highlight: rgba(255,255,255,0.80);
             --sdm-text: #0f172a;
-            --sdm-muted: #64748b;
+            --sdm-muted: #475569;
             --sdm-accent: #e11d48;
             --sdm-accent-soft: #fb7185;
             --sdm-accent-glow: rgba(225,29,72,0.30);
@@ -822,19 +834,21 @@
             position: fixed !important;
             right: 18px !important;
             width: ${CONFIG.POPUP_WIDTH}px !important;
-            padding: 9px 12px 11px 14px !important;
+            padding: 9px 12px 11px 12px !important;
             margin: 0 !important;
             overflow: hidden !important;
-            background-image: linear-gradient(180deg, var(--sdm-surface-a), var(--sdm-surface-b)) !important;
-            backdrop-filter: blur(10px) saturate(150%) !important;
-            -webkit-backdrop-filter: blur(10px) saturate(150%) !important;
+            background-color: transparent !important;
+            background-image: linear-gradient(155deg, var(--sdm-surface-a), var(--sdm-surface-b)) !important;
+            backdrop-filter: blur(20px) saturate(180%) !important;
+            -webkit-backdrop-filter: blur(20px) saturate(180%) !important;
             border: 1px solid var(--sdm-border) !important;
-            border-radius: 12px !important;
+            border-radius: 14px !important;
             box-shadow:
-                0 1px 2px rgba(15,23,42,0.05),
+                0 1px 2px rgba(15,23,42,0.06),
                 0 6px 12px -4px rgba(15,23,42,0.10),
                 0 18px 32px -14px rgba(15,23,42,0.22),
-                inset 0 1px 0 var(--sdm-highlight) !important;
+                inset 0 1px 0 var(--sdm-highlight),
+                inset 0 -1px 0 rgba(15,23,42,0.05) !important;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
             font-size: 13px !important;
             line-height: 1.4 !important;
@@ -860,19 +874,34 @@
         .sdmPopup:hover {
             transform: translateY(-1px) scale(var(--sdm-scale, 1)) !important;
             box-shadow:
-                0 1px 2px rgba(15,23,42,0.06),
+                0 1px 2px rgba(15,23,42,0.07),
                 0 10px 18px -6px rgba(15,23,42,0.14),
                 0 26px 44px -18px rgba(15,23,42,0.28),
-                inset 0 1px 0 var(--sdm-highlight) !important;
+                inset 0 1px 0 var(--sdm-highlight),
+                inset 0 -1px 0 rgba(15,23,42,0.05) !important;
         }
-        /* The accent rail: inset and rounded rather than a full-height border, with a
-           glow so it carries at the edge of vision. */
+        /* The specular sheen -- the thing that makes a pane read as glass rather than
+           as a flat translucent rectangle, and the one cue that still works when the
+           page behind is plain white. z-index:-1 keeps it above the card's own fill
+           but under the text, so nothing gets washed out; the transform on .sdmPopup
+           gives us the stacking context that keeps it clipped to the card. */
         .sdmPopup::before {
             content: "" !important;
-            position: absolute !important; left: 0 !important; top: 10px !important; bottom: 12px !important;
-            width: 3px !important; border-radius: 0 3px 3px 0 !important;
-            background-image: linear-gradient(180deg, var(--sdm-accent-soft), var(--sdm-accent)) !important;
-            box-shadow: 0 0 10px -1px var(--sdm-accent-glow) !important;
+            position: absolute !important; inset: 0 !important; z-index: -1 !important;
+            pointer-events: none !important; border-radius: inherit !important;
+            background-image: linear-gradient(140deg,
+                rgba(255,255,255,0.55) 0%,
+                rgba(255,255,255,0.18) 26%,
+                rgba(255,255,255,0) 52%) !important;
+        }
+        /* Without backdrop-filter there is nothing behind the glass to look at, and a
+           58%-white card over a busy list is just unreadable. Fall back to the solid
+           surface those browsers were getting before. */
+        @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+            .sdmPopup {
+                --sdm-surface-a: rgba(255,255,255,0.99);
+                --sdm-surface-b: rgba(248,250,252,0.99);
+            }
         }
         /* Urgency owns the accent -- everything here is inside an SLA countdown, so a
            P4 does not get to look calm. Priority colours its own chip instead. */
@@ -881,14 +910,14 @@
         .sdmPopup.sdmP3 { --sdm-prio-a: #eab308; --sdm-prio-b: #a16207; }
         .sdmPopup.sdmAcked {
             --sdm-accent: #059669; --sdm-accent-soft: #34d399; --sdm-accent-glow: rgba(5,150,105,0.30);
-            --sdm-surface-a: rgba(240,253,248,0.99); --sdm-surface-b: rgba(248,252,250,0.99);
+            --sdm-surface-a: rgba(236,253,245,0.74); --sdm-surface-b: rgba(240,253,248,0.58);
         }
         /* Under 30s the whole card is lit, not just the digits -- peripheral vision
            reads a change in the object long before it reads four characters. */
         .sdmPopup.sdmHot { animation: sdmEnter 420ms cubic-bezier(0.22,1,0.36,1) backwards, sdmBreathe 2.2s ease-in-out 420ms infinite !important; }
         @keyframes sdmBreathe {
-            0%, 100% { box-shadow: 0 1px 2px rgba(15,23,42,0.05), 0 6px 12px -4px rgba(15,23,42,0.10), 0 18px 32px -14px rgba(15,23,42,0.22), 0 0 0 0 rgba(225,29,72,0), inset 0 1px 0 var(--sdm-highlight); }
-            50%      { box-shadow: 0 1px 2px rgba(15,23,42,0.05), 0 6px 12px -4px rgba(15,23,42,0.10), 0 18px 34px -14px rgba(225,29,72,0.34), 0 0 0 3px rgba(225,29,72,0.10), inset 0 1px 0 var(--sdm-highlight); }
+            0%, 100% { box-shadow: 0 1px 2px rgba(15,23,42,0.06), 0 6px 12px -4px rgba(15,23,42,0.10), 0 18px 32px -14px rgba(15,23,42,0.22), 0 0 0 0 rgba(225,29,72,0), inset 0 1px 0 var(--sdm-highlight), inset 0 -1px 0 rgba(15,23,42,0.05); }
+            50%      { box-shadow: 0 1px 2px rgba(15,23,42,0.06), 0 6px 12px -4px rgba(15,23,42,0.10), 0 18px 34px -14px rgba(225,29,72,0.34), 0 0 0 3px rgba(225,29,72,0.10), inset 0 1px 0 var(--sdm-highlight), inset 0 -1px 0 rgba(15,23,42,0.05); }
         }
 
         .sdmPopup .sdmHead { display: flex !important; align-items: center !important; gap: 7px !important; margin: 0 !important; }
@@ -966,6 +995,9 @@
         .sdmPopup .sdmTrack {
             position: absolute !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
             height: 3px !important; margin: 0 !important; background: var(--sdm-track) !important; overflow: hidden !important;
+            /* The card's inner radius (14px outer, less the 1px border), so the bar
+               follows the bottom corners instead of cutting across them. */
+            border-radius: 0 0 13px 13px !important;
         }
         .sdmPopup .sdmFill {
             height: 100% !important; width: var(--sdm-progress, 100%) !important;
