@@ -1,8 +1,17 @@
 // ==UserScript==
 // @name         SD Monitor - Lead Assignment Dashboard
 // @namespace    geodis-sd-monitor
-// @version      0.5
+// @version      0.6
 // @description  Assign unassigned CORP-SD tickets to agents and track how many you've assigned this shift
+// @changelog    0.6 - The per-agent workload badge now counts what an agent is actually still
+//                     working. It was filtered on active=true alone, which keeps resolved
+//                     incidents and the closed-ish task states, so it read higher than the same
+//                     view in ServiceNow. It gets its own CONFIG.LOAD_FILTER — separate from the
+//                     queue's filter, since "needs assigning" and "still being carried" are
+//                     different questions — excluding Resolved/Closed/Canceled incidents and
+//                     Closed Complete/Incomplete/Skipped tasks. Still one combined number per
+//                     agent across both tables. __sdAssignDebug.loadQueries() hands back the
+//                     list URLs behind the badge for reconciling a count against SNOW.
 // @changelog    0.5 - Authentication fix: the browser no longer prompts for credentials. Requests
 //                     ride the SSO session cookies as before, but they now also carry the session
 //                     token (g_ck) that ServiceNow requires alongside the cookie — reads sent none
@@ -63,6 +72,19 @@
         ASSIGNMENT_GROUP: 'CORP-SD',
         TABLES: ['sc_task', 'incident'],
         EXTRA_FILTER: { incident: 'stateNOT IN7' }, // exclude Closed incidents — same reasoning as the ACK monitor
+        // Filter for the per-agent workload badge, deliberately separate from
+        // EXTRA_FILTER above: "what still needs assigning" and "what is an agent still
+        // carrying" are different questions. active=true on its own is not "open" — it
+        // keeps Resolved incidents and the closed-ish task states, which is why the
+        // badge read higher than the same view in ServiceNow. These are the stock state
+        // values; if your instance has custom choices, add them here and nothing else
+        // needs to change.
+        //   incident: 6 Resolved, 7 Closed, 8 Canceled
+        //   sc_task:  3 Closed Complete, 4 Closed Incomplete, 7 Closed Skipped
+        LOAD_FILTER: {
+            incident: 'stateNOT IN6,7,8',
+            sc_task: 'stateNOT IN3,4,7'
+        },
         AGENTS: [
             'Ibtissam EL FEKAK',
             'Fanel MALANDA',
@@ -272,14 +294,22 @@
         if (writtenId) throw new Error('Server kept the ticket assigned — undo did not take.');
     }
 
-    // Per-agent open workload. The aggregate API groups and counts server-side, so this
-    // stays one request per table and can't be wrong the way a capped list query would be.
+    // Exposed so the debug helper can hand back the exact query behind a badge — the
+    // only reliable way to reconcile a count against a ServiceNow list view.
+    function openLoadQuery(table, groupSysId) {
+        let query = `assignment_group=${groupSysId}^active=true^assigned_toISNOTEMPTY`;
+        if (CONFIG.LOAD_FILTER[table]) query += `^${CONFIG.LOAD_FILTER[table]}`;
+        return query;
+    }
+
+    // Per-agent open workload, summed across the tables so one badge covers a whole
+    // person. The aggregate API groups and counts server-side, so this stays one
+    // request per table and can't be wrong the way a capped list query would be.
     // Returns counts keyed by user sys_id.
     async function fetchOpenLoad(groupSysId) {
         const counts = {};
         for (const table of CONFIG.TABLES) {
-            let query = `assignment_group=${groupSysId}^active=true^assigned_toISNOTEMPTY`;
-            if (CONFIG.EXTRA_FILTER[table]) query += `^${CONFIG.EXTRA_FILTER[table]}`;
+            const query = openLoadQuery(table, groupSysId);
             const r = await snFetch(
                 `/api/now/stats/${table}?sysparm_query=${query}&sysparm_count=true&sysparm_group_by=assigned_to`
             );
@@ -851,7 +881,8 @@
             if (load != null) {
                 const isLightest = !isAway && lightest != null && load === lightest;
                 const loadEl = el('span', 'sdaRosterLoad' + (isLightest ? ' sdaLightest' : ''), `${load} open`);
-                loadEl.title = 'Tickets currently open and assigned to them in this group';
+                loadEl.title = `Incidents + tasks assigned to them in ${CONFIG.ASSIGNMENT_GROUP} that are still being worked`
+                    + ' — excludes resolved, closed, cancelled and skipped';
                 right.appendChild(loadEl);
             }
             right.appendChild(el('span', 'sdaRosterCount', count));
@@ -1213,6 +1244,13 @@
         // Auth triage: if a credential prompt ever comes back, check here first —
         // a null token is the cause, not a symptom.
         session() { return { token: sessionToken, broken: sessionBroken, polling: !!pollTimer }; },
+        // Reconciling a workload badge against ServiceNow: open these and the rows you
+        // see are exactly the rows the badge counted.
+        loadQueries() {
+            if (!groupSysId) return 'Group not resolved yet — run a poll first.';
+            return CONFIG.TABLES.map(t =>
+                `${location.origin}/${t}_list.do?sysparm_query=${encodeURIComponent(openLoadQuery(t, groupSysId) + '^GROUPBYassigned_to')}`);
+        },
         refreshToken() { return getSessionToken(true); },
         reconnect: reconnectSession
     };
