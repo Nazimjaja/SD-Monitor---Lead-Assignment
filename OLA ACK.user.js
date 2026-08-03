@@ -1,11 +1,17 @@
 // ==UserScript==
 // @name         SD Monitor - Live Acknowledge Popup
 // @namespace    geodis-sd-monitor
-// @version      0.12
+// @version      0.13
 // @description  Cross-site synced live alert for unacknowledged tickets; full function on ServiceNow, mirrored popups elsewhere
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
+// @changelog    0.13 - The status pill now carries the running version, read from the script's
+//                     own metadata rather than typed in, so it can't drift from @version. Two
+//                     reasons it earns its place now that the script auto-updates from GitHub:
+//                     it's the visible confirmation that an update actually landed, and a tab
+//                     opened before an update keeps running the old code until it reloads, so
+//                     "which version is this tab on" stops being answerable from memory.
 // @changelog    0.12 - Acknowledging an incident no longer overwrites an Impact somebody had
 //                     already set. The mandatory-field step filled Impact whenever it wasn't
 //                     already 3-Low, but clicking Acknowledge submits the whole form, so that
@@ -85,7 +91,14 @@
     // A page counts as "the real thing" only if it's actually a ServiceNow instance.
     // Everywhere else, the script only mirrors popups and relays ack requests back here.
     const IS_SNOW_HOST = /\.service-now\.com$/i.test(location.hostname);
-    console.log(`[ACK Monitor] loaded on ${location.hostname} — mode: ${IS_SNOW_HOST ? 'SNOW (full)' : 'mirror-only'}`);
+
+    // Read back from the installed script's own metadata rather than being typed
+    // here, so it can't drift from @version the way a hand-maintained copy would.
+    // Shown on the status pill: with the script auto-updating from GitHub, "which
+    // version is this tab actually running" stops being answerable by memory —
+    // tabs opened before an update keep running the old code until they reload.
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '?';
+    console.log(`[ACK Monitor] v${SCRIPT_VERSION} loaded on ${location.hostname} — mode: ${IS_SNOW_HOST ? 'SNOW (full)' : 'mirror-only'}`);
 
     // ─── CONFIG ─────────────────────────────────────────────────────────────
     const CONFIG = {
@@ -669,6 +682,17 @@
             margin: 0 !important;
         }
         #sdmStatusIndicator.sdmErrorState .sdmDot { background: #e5484d !important; animation: none !important; }
+        #sdmStatusIndicator .sdmVer {
+            font-size: 10px !important;
+            font-weight: 600 !important;
+            letter-spacing: 0.02em !important;
+            color: rgba(26,26,46,0.45) !important;
+            background: rgba(26,26,46,0.07) !important;
+            border-radius: 6px !important;
+            padding: 2px 5px !important;
+            margin: 0 !important;
+            flex: 0 0 auto !important;
+        }
         #sdmStatusIndicator .sdmReconnectBtn {
             display: none !important;
             border: none !important;
@@ -701,8 +725,12 @@
         statusEl = document.createElement('div');
         statusEl.id = 'sdmStatusIndicator';
         statusEl.innerHTML = `<span class="sdmDot"></span><span class="sdmStatusText">ACK Monitor loaded</span>`
+            + `<span class="sdmVer"></span>`
             + `<button class="sdmReconnectBtn" type="button">Reconnect</button>`;
         document.body.appendChild(statusEl);
+        // Its own span rather than part of the status text, which setStatus rewrites
+        // on every poll — the version has to survive those.
+        statusEl.querySelector('.sdmVer').textContent = `v${SCRIPT_VERSION}`;
         statusTextEl = statusEl.querySelector('.sdmStatusText');
         reconnectBtn = statusEl.querySelector('.sdmReconnectBtn');
         reconnectBtn.addEventListener('click', reconnectSession);
