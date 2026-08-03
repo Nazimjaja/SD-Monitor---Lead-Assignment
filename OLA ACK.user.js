@@ -1,11 +1,30 @@
 // ==UserScript==
 // @name         SD Monitor - Live Acknowledge Popup
 // @namespace    geodis-sd-monitor
-// @version      0.14
+// @version      0.15
 // @description  Cross-site synced live alert for unacknowledged tickets; full function on ServiceNow, mirrored popups elsewhere
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
+// @changelog    0.15 - The alert sound is fixed and the popup redesigned.
+//                     Sound: an AudioContext built before the tab has seen a click is born
+//                     suspended, and scheduling notes on a suspended context does nothing,
+//                     silently. That context was cached forever and resume() was never
+//                     called, so the first alert after a page load — exactly the case where
+//                     nobody has clicked yet, because the agent is looking at another
+//                     window — turned the sound off for the whole session. The first user
+//                     gesture anywhere on the page now resumes it, and every alert resumes
+//                     before playing rather than scheduling into a sleeping context.
+//                     __ackMonitorDebug.testSound() reports whether the browser is allowing
+//                     audio at all.
+//                     Popup: rebuilt on one surface, one type scale and one accent. The
+//                     heavy translucency is gone — it was what made the popup read
+//                     differently on every background it landed on. Priority now has its own
+//                     chip, the description gets two lines instead of being crushed onto the
+//                     meta line, the countdown uses tabular figures so it stops jittering
+//                     every second, and a progress bar drains alongside it. Emoji are out.
+//                     A ghost "Open" button reaches the ticket without acknowledging it
+//                     first. Dark mode is honoured for the tabs this mirrors onto.
 // @changelog    0.14 - Acknowledging no longer dead-ends in "Timed out waiting for the
 //                     Acknowledge button/confirmation". Two changes. The frame the ticket
 //                     form loads in was 1px by 1px at opacity 0: that lays the form out at
@@ -736,61 +755,130 @@
         .sdmPopup, .sdmPopup * {
             box-sizing: border-box !important;
         }
+        /* One surface, one type scale, one accent — the previous version leaned on
+           heavy translucency, which is what made it read differently (and cheaply) on
+           every background it happened to land on. A near-solid card behaves the same
+           over a SNOW list, a dashboard or a mirror tab. Colours go through custom
+           properties so the acked/priority variants change one value, not ten rules. */
         .sdmPopup {
+            --sdm-surface: #ffffff;
+            --sdm-border: rgba(15,23,42,0.10);
+            --sdm-text: #0f172a;
+            --sdm-muted: #64748b;
+            --sdm-accent: #e11d48;
+            --sdm-prio: #64748b;
+            --sdm-btn: #0f172a;
+            --sdm-btn-text: #ffffff;
+            --sdm-ghost-border: rgba(15,23,42,0.14);
+            --sdm-track: rgba(15,23,42,0.08);
             position: fixed !important;
-            right: 18px !important;
+            right: 20px !important;
             width: ${CONFIG.POPUP_WIDTH}px !important;
-            background: rgba(255, 255, 255, 0.68) !important;
-            backdrop-filter: blur(20px) saturate(180%) !important;
-            -webkit-backdrop-filter: blur(20px) saturate(180%) !important;
-            border: 1px solid rgba(255, 255, 255, 0.45) !important;
-            border-radius: 14px !important;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.18), 0 1px 2px rgba(0,0,0,0.06) !important;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
-            z-index: 999999 !important;
-            padding: 14px 16px !important;
-            margin: 0 !important;
-            color: #1a1a2e !important;
-            transition: top 0.25s ease !important;
-        }
-        .sdmPopup.sdmPending { border-left: 4px solid #e5484d !important; }
-        .sdmPopup.sdmAcked   { border-left: 4px solid #2e9e5b !important; }
-        .sdmPopup h3 {
-            margin: 0 0 4px 0 !important; font-size: 14px !important; font-weight: 600 !important;
-            letter-spacing: -0.01em !important; padding-right: 14px !important;
-            color: #1a1a2e !important; line-height: 1.3 !important;
-        }
-        .sdmPopup .sdmMeta { font-size: 12px !important; color: rgba(26,26,46,0.65) !important; margin: 0 0 8px 0 !important; line-height: 1.4 !important; }
-        .sdmPopup .sdmCountdown { font-size: 18px !important; font-weight: 700 !important; color: #e5484d !important; margin: 0 0 10px 0 !important; letter-spacing: 0.02em !important; }
-        .sdmPopup .sdmCountdown.overdue { color: #b3261e !important; animation: sdmBlink 1s infinite !important; }
-        @keyframes sdmBlink { 50% { opacity: 0.45; } }
-        .sdmPopup button {
-            width: 100% !important;
-            padding: 8px !important;
-            margin: 0 !important;
-            background: rgba(46, 125, 50, 0.92) !important;
-            color: white !important;
-            border: none !important;
-            border-radius: 8px !important;
+            background: var(--sdm-surface) !important;
+            border: 1px solid var(--sdm-border) !important;
+            border-left: 3px solid var(--sdm-accent) !important;
+            border-radius: 10px !important;
+            box-shadow: 0 1px 2px rgba(15,23,42,0.06), 0 12px 28px -8px rgba(15,23,42,0.28) !important;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
             font-size: 13px !important;
-            font-weight: 500 !important;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
-            line-height: normal !important;
-            cursor: pointer !important;
-            box-shadow: none !important;
-            transition: background 0.15s ease !important;
+            line-height: 1.45 !important;
+            text-align: left !important;
+            color: var(--sdm-text) !important;
+            z-index: 999999 !important;
+            padding: 12px 14px !important;
+            margin: 0 !important;
+            transition: top 0.2s ease !important;
         }
-        .sdmPopup button:hover { background: rgba(37, 100, 40, 0.95) !important; }
-        .sdmPopup button:disabled { background: rgba(150,150,150,0.55) !important; cursor: default !important; }
-        .sdmPopup .sdmOpenBtn { background: rgba(59, 130, 246, 0.9) !important; margin-top: 8px !important; }
-        .sdmPopup .sdmOpenBtn:hover { background: rgba(37, 99, 235, 0.95) !important; }
-        .sdmPopup .sdmError { color: #b3261e !important; font-size: 11px !important; margin: 6px 0 0 0 !important; }
-        .sdmPopup .sdmSuccess { color: #1a1a2e !important; font-size: 13px !important; font-weight: 600 !important; padding: 2px 0 8px 0 !important; margin: 0 !important; }
-        .sdmPopup .sdmCloseX {
-            position: absolute !important; top: 10px !important; right: 12px !important; cursor: pointer !important;
-            font-size: 13px !important; color: rgba(26,26,46,0.4) !important; line-height: 1 !important;
+        @media (prefers-color-scheme: dark) {
+            .sdmPopup {
+                --sdm-surface: #151a21;
+                --sdm-border: rgba(255,255,255,0.12);
+                --sdm-text: #e6e9ef;
+                --sdm-muted: #9aa4b2;
+                --sdm-btn: #e6e9ef;
+                --sdm-btn-text: #0f172a;
+                --sdm-ghost-border: rgba(255,255,255,0.18);
+                --sdm-track: rgba(255,255,255,0.12);
+                box-shadow: 0 1px 2px rgba(0,0,0,0.4), 0 12px 28px -8px rgba(0,0,0,0.6) !important;
+            }
         }
-        .sdmPopup .sdmCloseX:hover { color: rgba(26,26,46,0.8) !important; }
+        /* The accent tracks urgency, not priority: everything here is inside an SLA
+           countdown, so a P4 does not get to look calm. Priority colours its own chip. */
+        .sdmPopup.sdmAcked { --sdm-accent: #059669; }
+        .sdmPopup.sdmP1 { --sdm-prio: #dc2626; }
+        .sdmPopup.sdmP2 { --sdm-prio: #ea580c; }
+        .sdmPopup.sdmP3 { --sdm-prio: #ca8a04; }
+
+        .sdmPopup .sdmHead { display: flex !important; align-items: center !important; gap: 8px !important; margin: 0 0 5px 0 !important; }
+        .sdmPopup .sdmPrio {
+            font-size: 10px !important; font-weight: 700 !important; letter-spacing: 0.05em !important;
+            color: #ffffff !important; background: var(--sdm-prio) !important;
+            border-radius: 4px !important; padding: 2px 5px !important; margin: 0 !important;
+            flex: 0 0 auto !important; line-height: 1.3 !important;
+        }
+        .sdmPopup .sdmNum {
+            font-size: 13.5px !important; font-weight: 650 !important; letter-spacing: -0.01em !important;
+            color: var(--sdm-text) !important; flex: 1 1 auto !important; min-width: 0 !important;
+            overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important;
+        }
+        .sdmPopup .sdmClose {
+            flex: 0 0 auto !important; width: 20px !important; height: 20px !important; padding: 0 !important; margin: 0 !important;
+            border: none !important; background: transparent !important; box-shadow: none !important;
+            color: var(--sdm-muted) !important; font-size: 15px !important; line-height: 1 !important;
+            cursor: pointer !important; border-radius: 4px !important; opacity: 0.7 !important;
+        }
+        .sdmPopup .sdmClose:hover { opacity: 1 !important; background: var(--sdm-track) !important; }
+
+        .sdmPopup .sdmDesc {
+            font-size: 12.5px !important; color: var(--sdm-muted) !important; margin: 0 0 10px 0 !important;
+            display: -webkit-box !important; -webkit-line-clamp: 2 !important; -webkit-box-orient: vertical !important;
+            overflow: hidden !important;
+        }
+
+        .sdmPopup .sdmTimerRow { display: flex !important; align-items: baseline !important; justify-content: space-between !important; gap: 8px !important; margin: 0 0 5px 0 !important; }
+        .sdmPopup .sdmTimerLabel { font-size: 10px !important; font-weight: 600 !important; letter-spacing: 0.07em !important; text-transform: uppercase !important; color: var(--sdm-muted) !important; }
+        /* Tabular figures: without them the countdown visibly jitters every second as
+           glyph widths change, which is the sort of detail that reads as unfinished. */
+        .sdmPopup .sdmTime {
+            font-size: 17px !important; font-weight: 700 !important; letter-spacing: 0.01em !important;
+            font-variant-numeric: tabular-nums !important; font-feature-settings: "tnum" 1 !important;
+            color: var(--sdm-text) !important;
+        }
+        .sdmPopup .sdmTime.sdmUrgent { color: var(--sdm-accent) !important; }
+        .sdmPopup .sdmTime.sdmOver { color: var(--sdm-accent) !important; font-size: 13.5px !important; letter-spacing: 0.06em !important; animation: sdmFade 1.4s ease-in-out infinite !important; }
+        @keyframes sdmFade { 50% { opacity: 0.45; } }
+        .sdmPopup .sdmTrack { height: 3px !important; margin: 0 0 12px 0 !important; border-radius: 2px !important; background: var(--sdm-track) !important; overflow: hidden !important; }
+        /* Width comes through a custom property, not an inline style: every visual
+           rule here is !important to survive the host page, and an inline width can
+           never override its own !important declaration. The variable can. */
+        .sdmPopup .sdmFill { height: 100% !important; width: var(--sdm-progress, 100%) !important; background: var(--sdm-accent) !important; border-radius: 2px !important; transition: width 1s linear !important; }
+
+        .sdmPopup .sdmActions { display: flex !important; gap: 8px !important; }
+        .sdmPopup .sdmBtn {
+            flex: 1 1 auto !important; height: 32px !important; padding: 0 12px !important; margin: 0 !important;
+            background: var(--sdm-btn) !important; color: var(--sdm-btn-text) !important;
+            border: 1px solid transparent !important; border-radius: 6px !important;
+            font-family: inherit !important; font-size: 12.5px !important; font-weight: 600 !important; line-height: 1 !important;
+            text-align: center !important; cursor: pointer !important; box-shadow: none !important;
+            transition: opacity 0.15s ease !important;
+        }
+        .sdmPopup .sdmBtn:hover { opacity: 0.85 !important; }
+        .sdmPopup .sdmBtn:disabled { opacity: 0.45 !important; cursor: default !important; }
+        .sdmPopup .sdmGhost {
+            flex: 0 0 auto !important; background: transparent !important;
+            color: var(--sdm-muted) !important; border-color: var(--sdm-ghost-border) !important;
+        }
+        .sdmPopup .sdmGhost:hover { background: var(--sdm-track) !important; opacity: 1 !important; }
+
+        .sdmPopup .sdmError { font-size: 11.5px !important; line-height: 1.4 !important; color: var(--sdm-accent) !important; margin: 8px 0 0 0 !important; }
+
+        .sdmPopup .sdmDone { display: flex !important; align-items: center !important; gap: 8px !important; margin: 0 0 10px 0 !important; }
+        .sdmPopup .sdmCheck {
+            width: 18px !important; height: 18px !important; flex: 0 0 auto !important;
+            border-radius: 50% !important; background: var(--sdm-accent) !important; color: #ffffff !important;
+            font-size: 11px !important; font-weight: 700 !important; line-height: 18px !important; text-align: center !important;
+        }
+        .sdmPopup .sdmDoneText { font-size: 12.5px !important; color: var(--sdm-text) !important; min-width: 0 !important; }
 
         #sdmStatusIndicator, #sdmStatusIndicator * {
             box-sizing: border-box !important;
@@ -815,6 +903,15 @@
             align-items: center !important;
             gap: 6px !important;
             user-select: none !important;
+        }
+        @media (prefers-color-scheme: dark) {
+            #sdmStatusIndicator {
+                background: rgba(21,26,33,0.85) !important;
+                border-color: rgba(255,255,255,0.12) !important;
+                color: rgba(230,233,239,0.8) !important;
+                box-shadow: 0 4px 16px rgba(0,0,0,0.5) !important;
+            }
+            #sdmStatusIndicator .sdmVer { color: rgba(230,233,239,0.55) !important; background: rgba(255,255,255,0.1) !important; }
         }
         #sdmStatusIndicator .sdmDot {
             width: 7px !important; height: 7px !important; border-radius: 50% !important;
@@ -917,36 +1014,85 @@
     }
 
     // ─── ALERT SOUND — synthesized, no external file needed ────────────────
-    // Note: browsers block audio until the page has had some user interaction
-    // (click/keypress). Since agents are actively working the SNOW page, this
-    // should already be satisfied in practice, but it's worth knowing if a
-    // popup's very first sound seems to silently not play after a fresh load.
+    // The autoplay policy is the whole story here, and the old code lost to it in a
+    // way it could never recover from. An AudioContext constructed before the tab has
+    // seen a user gesture is born 'suspended', and scheduling notes on a suspended
+    // context does nothing at all — silently. That context was then cached forever and
+    // resume() was never called, so the *first* alert after a page load (exactly the
+    // case where nobody has clicked yet — the agent is looking at another window,
+    // which is the whole point of an alerting tool) turned the sound off for the rest
+    // of the session, no matter how much they clicked afterwards.
+    //
+    // Two fixes: take the first user gesture the tab sees, anywhere on the page, to
+    // get the context running; and resume before every alert, playing from inside the
+    // promise so notes are never scheduled onto a context that is still asleep.
     let audioCtx = null;
+
+    function getAudioCtx() {
+        const Ctor = window.AudioContext || window.webkitAudioContext;
+        if (!Ctor) return null;
+        if (!audioCtx || audioCtx.state === 'closed') audioCtx = new Ctor();
+        return audioCtx;
+    }
+
+    function unlockAudio() {
+        if (!CONFIG.SOUND_ENABLED) return;
+        const ctx = getAudioCtx();
+        if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {});
+    }
+    // Capturing and passive: this must not interfere with the host page's own
+    // handling of the click, it only needs to know one happened.
+    ['pointerdown', 'keydown'].forEach(evt =>
+        document.addEventListener(evt, unlockAudio, { capture: true, passive: true }));
+
     function playAlertSound() {
         if (!CONFIG.SOUND_ENABLED) return;
-        try {
-            audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-            const now = audioCtx.currentTime;
-            [880, 1108].forEach((freq, i) => {
-                const osc = audioCtx.createOscillator();
-                const gain = audioCtx.createGain();
-                osc.type = 'sine';
-                osc.frequency.value = freq;
-                const t0 = now + i * 0.15;
-                gain.gain.setValueAtTime(0, t0);
-                gain.gain.linearRampToValueAtTime(0.15, t0 + 0.02);
-                gain.gain.linearRampToValueAtTime(0, t0 + 0.18);
-                osc.connect(gain).connect(audioCtx.destination);
-                osc.start(t0);
-                osc.stop(t0 + 0.2);
+        const ctx = getAudioCtx();
+        if (!ctx) { console.warn('[ACK Monitor] no Web Audio support — alert is silent.'); return; }
+
+        const beep = () => {
+            try {
+                const now = ctx.currentTime;
+                [880, 1108].forEach((freq, i) => {
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.type = 'sine';
+                    osc.frequency.value = freq;
+                    const t0 = now + i * 0.15;
+                    gain.gain.setValueAtTime(0, t0);
+                    gain.gain.linearRampToValueAtTime(0.15, t0 + 0.02);
+                    gain.gain.linearRampToValueAtTime(0, t0 + 0.18);
+                    osc.connect(gain).connect(ctx.destination);
+                    osc.start(t0);
+                    osc.stop(t0 + 0.2);
+                });
+            } catch (e) {
+                console.warn('[ACK Monitor] could not play alert sound', e);
+            }
+        };
+
+        if (ctx.state === 'suspended') {
+            ctx.resume().then(beep).catch(() => {
+                console.warn('[ACK Monitor] the browser is still blocking audio on this tab — click anywhere on the page once and later alerts will sound.');
             });
-        } catch (e) {
-            console.warn('[ACK Monitor] could not play alert sound', e);
+            return;
         }
+        beep();
     }
 
     // ─── POPUP STACKING (runs on every page — mirrors included) ─────────────
     const popupsBySysId = new Map();
+
+    // A mirror tab has no ServiceNow origin of its own, so the ticket carries the one
+    // it was found on. Shared by the pending and acknowledged states.
+    function openTicket(ticket) {
+        const base = ticket.origin || (IS_SNOW_HOST ? location.origin : '');
+        if (!base) {
+            console.warn('[ACK Monitor] no known SNOW origin for this ticket — cannot open it from here.');
+            return;
+        }
+        window.open(`${base}/${ticket.table}.do?sys_id=${ticket.sys_id}&sysparm_stack=no`, '_blank');
+    }
 
     function relayoutPopups() {
         let top = 24;
@@ -987,33 +1133,47 @@
         popup.classList.add('sdmAcked');
         popup.textContent = '';
 
-        const closeX = document.createElement('span');
-        closeX.className = 'sdmCloseX';
-        closeX.title = 'Dismiss';
-        closeX.textContent = '✕';
+        const head = document.createElement('div');
+        head.className = 'sdmHead';
 
-        const success = document.createElement('div');
-        success.className = 'sdmSuccess';
-        success.textContent = `✅ ${ticket.number} acknowledged by ${ackedByName}`;
+        const num = document.createElement('span');
+        num.className = 'sdmNum';
+        num.textContent = ticket.number;
 
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'sdmClose';
+        closeBtn.type = 'button';
+        closeBtn.title = 'Dismiss';
+        closeBtn.setAttribute('aria-label', 'Dismiss');
+        closeBtn.textContent = '×';
+
+        head.append(num, closeBtn);
+
+        const done = document.createElement('div');
+        done.className = 'sdmDone';
+        const check = document.createElement('span');
+        check.className = 'sdmCheck';
+        check.textContent = '✓';
+        const doneText = document.createElement('span');
+        doneText.className = 'sdmDoneText';
+        doneText.textContent = `Acknowledged by ${ackedByName}`;
+        done.append(check, doneText);
+
+        const actions = document.createElement('div');
+        actions.className = 'sdmActions';
         const openBtn = document.createElement('button');
-        openBtn.className = 'sdmOpenBtn';
-        openBtn.textContent = '🔗 Open Ticket';
+        openBtn.className = 'sdmBtn sdmGhost sdmOpenBtn';
+        openBtn.type = 'button';
+        openBtn.textContent = 'Open ticket';
+        actions.append(openBtn);
 
-        popup.append(closeX, success, openBtn);
+        popup.append(head, done, actions);
 
-        closeX.addEventListener('click', () => {
+        closeBtn.addEventListener('click', () => {
             removePopup(ticket.sys_id);
             publishEvent({ type: 'TICKET_REMOVED', sys_id: ticket.sys_id });
         });
-        openBtn.addEventListener('click', () => {
-            const base = ticket.origin || (IS_SNOW_HOST ? location.origin : '');
-            if (base) {
-                window.open(`${base}/${ticket.table}.do?sys_id=${ticket.sys_id}&sysparm_stack=no`, '_blank');
-            } else {
-                console.warn('[ACK Monitor] no known SNOW origin for this ticket — cannot open it from here.');
-            }
-        });
+        openBtn.addEventListener('click', () => openTicket(ticket));
 
         popup._closeTimer = setTimeout(() => removePopup(ticket.sys_id), Math.max(remainingMs, 0));
         relayoutPopups();
@@ -1025,7 +1185,7 @@
         if (popup._ackRequestTimeout) clearTimeout(popup._ackRequestTimeout);
         const ackBtn = popup.querySelector('.sdmAckBtn');
         const errorEl = popup.querySelector('.sdmError');
-        if (ackBtn) { ackBtn.disabled = false; ackBtn.textContent = 'Acknowledged'; }
+        if (ackBtn) { ackBtn.disabled = false; ackBtn.textContent = 'Acknowledge'; }
         if (errorEl) { errorEl.textContent = `❌ ${message}`; errorEl.style.display = 'block'; }
         relayoutPopups();
     }
@@ -1037,27 +1197,64 @@
         // ticket.number/short_desc are server-supplied strings that end up rendered
         // on every domain this script runs on, so they must never be parsed as HTML.
         const popup = document.createElement('div');
-        popup.className = 'sdmPopup sdmPending';
+        // P1/P2 carry their own chip colour; anything else stays neutral rather than
+        // inventing a shade per priority value the instance might use.
+        const prioClass = /^P[123]$/.test(ticket.priority || '') ? ` sdm${ticket.priority}` : '';
+        popup.className = `sdmPopup sdmPending${prioClass}`;
 
-        const title = document.createElement('h3');
-        title.textContent = `🎫 ${ticket.number}`;
+        const head = document.createElement('div');
+        head.className = 'sdmHead';
 
-        const meta = document.createElement('div');
-        meta.className = 'sdmMeta';
-        meta.textContent = `${ticket.short_desc}${ticket.priority ? ' · ' + ticket.priority : ''}`;
+        const prio = document.createElement('span');
+        prio.className = 'sdmPrio';
+        prio.textContent = ticket.priority || (ticket.table === 'sc_task' ? 'TASK' : 'INC');
 
-        const countdownEl = document.createElement('div');
-        countdownEl.className = 'sdmCountdown';
+        const num = document.createElement('span');
+        num.className = 'sdmNum';
+        num.textContent = ticket.number;
 
+        head.append(prio, num);
+
+        const desc = document.createElement('div');
+        desc.className = 'sdmDesc';
+        desc.textContent = ticket.short_desc;
+
+        const timerRow = document.createElement('div');
+        timerRow.className = 'sdmTimerRow';
+        const timerLabel = document.createElement('span');
+        timerLabel.className = 'sdmTimerLabel';
+        timerLabel.textContent = 'Acknowledge within';
+        const countdownEl = document.createElement('span');
+        countdownEl.className = 'sdmTime';
+        timerRow.append(timerLabel, countdownEl);
+
+        // The bar says at a glance how much of the window is gone — readable from
+        // across a desk in a way that four digits are not.
+        const track = document.createElement('div');
+        track.className = 'sdmTrack';
+        const fill = document.createElement('div');
+        fill.className = 'sdmFill';
+        track.append(fill);
+
+        const actions = document.createElement('div');
+        actions.className = 'sdmActions';
         const ackBtn = document.createElement('button');
-        ackBtn.className = 'sdmAckBtn';
-        ackBtn.textContent = 'Acknowledged';
+        ackBtn.className = 'sdmBtn sdmAckBtn';
+        ackBtn.type = 'button';
+        ackBtn.textContent = 'Acknowledge';
+        const openBtn = document.createElement('button');
+        openBtn.className = 'sdmBtn sdmGhost sdmOpenBtn';
+        openBtn.type = 'button';
+        openBtn.textContent = 'Open';
+        openBtn.title = 'Open the ticket in a new tab';
+        openBtn.addEventListener('click', () => openTicket(ticket));
+        actions.append(ackBtn, openBtn);
 
         const errorEl = document.createElement('div');
         errorEl.className = 'sdmError';
         errorEl.style.display = 'none';
 
-        popup.append(title, meta, countdownEl, ackBtn, errorEl);
+        popup.append(head, desc, timerRow, track, actions, errorEl);
         document.body.appendChild(popup);
         popupsBySysId.set(ticket.sys_id, popup);
         if (playSound) playAlertSound();
@@ -1067,10 +1264,14 @@
         // opens or reloads mid-alert shows the same time remaining as every other
         // tab instead of restarting at the full duration.
         function renderCountdown() {
-            const remaining = CONFIG.COUNTDOWN_SECONDS - Math.floor((Date.now() - shownAt) / 1000);
+            const total = CONFIG.COUNTDOWN_SECONDS;
+            const remaining = total - Math.floor((Date.now() - shownAt) / 1000);
             if (remaining <= 0) {
                 countdownEl.textContent = 'OVERDUE';
-                countdownEl.classList.add('overdue');
+                countdownEl.classList.remove('sdmUrgent');
+                countdownEl.classList.add('sdmOver');
+                timerLabel.textContent = 'SLA breached';
+                fill.style.setProperty('--sdm-progress', '0%');
                 if (popup._countdownTimer) {
                     clearInterval(popup._countdownTimer);
                     popup._countdownTimer = null;
@@ -1080,10 +1281,12 @@
             const mm = String(Math.floor(remaining / 60)).padStart(2, '0');
             const ss = String(remaining % 60).padStart(2, '0');
             countdownEl.textContent = `${mm}:${ss}`;
+            countdownEl.classList.toggle('sdmUrgent', remaining <= 30);
+            fill.style.setProperty('--sdm-progress', `${Math.max(0, Math.min(100, (remaining / total) * 100))}%`);
         }
         renderCountdown();
         relayoutPopups();
-        if (!countdownEl.classList.contains('overdue')) {
+        if (!countdownEl.classList.contains('sdmOver')) {
             popup._countdownTimer = setInterval(renderCountdown, 1000);
         }
 
@@ -1347,6 +1550,14 @@
                 '| due now:', pollIsDue());
             return last;
         },
+        // Sound triage: state 'running' means the browser is letting us play. A
+        // 'suspended' that survives a click on the page is the autoplay policy, not
+        // a bug here — and testSound() will say so rather than failing quietly.
+        audio() {
+            const ctx = getAudioCtx();
+            return { enabled: CONFIG.SOUND_ENABLED, state: ctx ? ctx.state : 'unsupported' };
+        },
+        testSound() { playAlertSound(); return this.audio(); },
         // Watch an acknowledge happen. Runs the real flow with the frame on screen and
         // a step-by-step trace in the console — the only way to see which step a
         // stubborn instance stops at, since the whole thing normally happens off-screen.
