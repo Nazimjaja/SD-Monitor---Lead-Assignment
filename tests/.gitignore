@@ -1,2 +1,6 @@
 .screenshots/
 node_modules/
+# Playwright is resolved at runtime — a local install, or a global one already on
+# the machine (harness.js tries both). Pinning a lock here would only pin the local
+# half of that, so the install is treated as an artifact like node_modules.
+package-lock.json
