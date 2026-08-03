@@ -1,11 +1,28 @@
 // ==UserScript==
 // @name         SD Monitor - Live Acknowledge Popup
 // @namespace    geodis-sd-monitor
-// @version      0.15
+// @version      0.16
 // @description  Cross-site synced live alert for unacknowledged tickets; full function on ServiceNow, mirrored popups elsewhere
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
+// @changelog    0.16 - Popup redesigned again, to the compact layout with the countdown as
+//                     the card's bottom edge. It loses a whole line by putting the clock on
+//                     the header row beside the ticket number, and the remaining time reads
+//                     off the draining edge instead of a row of its own — smaller than the
+//                     previous card while carrying the same information.
+//                     The flat surface is gone. Depth is built from layers rather than one
+//                     blur: a near-opaque gradient surface, a hairline border, an inset top
+//                     highlight, and a shadow in three steps from contact to ambient, over a
+//                     light backdrop blur — depth against a ServiceNow list rather than
+//                     frosted glass over it. The accent rail is inset, rounded and lit; the
+//                     priority chip is a gradient with its own highlight; buttons have a
+//                     press state and a spinner while an acknowledge is in flight, which can
+//                     take seconds. Popups slide in, lift on hover and animate out instead of
+//                     disappearing mid-blink, and under 30 seconds the whole card breathes
+//                     and the edge sweeps — peripheral vision reads a change in the object
+//                     long before it reads four characters. All of it is disabled for anyone
+//                     who has asked their system for reduced motion.
 // @changelog    0.15 - The alert sound is fixed and the popup redesigned.
 //                     Sound: an AudioContext built before the tab has seen a click is born
 //                     suspended, and scheduling notes on a suspended context does nothing,
@@ -755,130 +772,243 @@
         .sdmPopup, .sdmPopup * {
             box-sizing: border-box !important;
         }
-        /* One surface, one type scale, one accent — the previous version leaned on
-           heavy translucency, which is what made it read differently (and cheaply) on
-           every background it happened to land on. A near-solid card behaves the same
-           over a SNOW list, a dashboard or a mirror tab. Colours go through custom
-           properties so the acked/priority variants change one value, not ten rules. */
+        /* Depth is built from layers, not from one blur: a near-opaque surface with a
+           faint vertical gradient, a hairline border, an inset top highlight for the
+           lit edge, and a shadow in four steps from contact to ambient. The blur is
+           kept low and sits under an almost-solid fill, so it reads as depth against
+           a ServiceNow list rather than as frosted glass over it. Every variant --
+           priority, urgency, acknowledged -- moves custom properties, not rules. */
         .sdmPopup {
-            --sdm-surface: #ffffff;
-            --sdm-border: rgba(15,23,42,0.10);
+            --sdm-surface-a: rgba(255,255,255,0.99);
+            --sdm-surface-b: rgba(248,250,252,0.99);
+            --sdm-border: rgba(15,23,42,0.09);
+            --sdm-highlight: rgba(255,255,255,0.95);
             --sdm-text: #0f172a;
             --sdm-muted: #64748b;
             --sdm-accent: #e11d48;
-            --sdm-prio: #64748b;
-            --sdm-btn: #0f172a;
+            --sdm-accent-soft: #fb7185;
+            --sdm-accent-glow: rgba(225,29,72,0.30);
+            --sdm-prio-a: #64748b;
+            --sdm-prio-b: #475569;
+            --sdm-btn-a: #1e293b;
+            --sdm-btn-b: #0f172a;
             --sdm-btn-text: #ffffff;
-            --sdm-ghost-border: rgba(15,23,42,0.14);
-            --sdm-track: rgba(15,23,42,0.08);
+            --sdm-hairline: rgba(15,23,42,0.13);
+            --sdm-track: rgba(15,23,42,0.07);
+            --sdm-progress: 100%;
+
             position: fixed !important;
-            right: 20px !important;
+            right: 18px !important;
             width: ${CONFIG.POPUP_WIDTH}px !important;
-            background: var(--sdm-surface) !important;
+            padding: 9px 12px 11px 14px !important;
+            margin: 0 !important;
+            overflow: hidden !important;
+            background-image: linear-gradient(180deg, var(--sdm-surface-a), var(--sdm-surface-b)) !important;
+            backdrop-filter: blur(10px) saturate(150%) !important;
+            -webkit-backdrop-filter: blur(10px) saturate(150%) !important;
             border: 1px solid var(--sdm-border) !important;
-            border-left: 3px solid var(--sdm-accent) !important;
-            border-radius: 10px !important;
-            box-shadow: 0 1px 2px rgba(15,23,42,0.06), 0 12px 28px -8px rgba(15,23,42,0.28) !important;
+            border-radius: 12px !important;
+            box-shadow:
+                0 1px 2px rgba(15,23,42,0.05),
+                0 6px 12px -4px rgba(15,23,42,0.10),
+                0 18px 32px -14px rgba(15,23,42,0.22),
+                inset 0 1px 0 var(--sdm-highlight) !important;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
             font-size: 13px !important;
-            line-height: 1.45 !important;
+            line-height: 1.4 !important;
             text-align: left !important;
             color: var(--sdm-text) !important;
             z-index: 999999 !important;
-            padding: 12px 14px !important;
-            margin: 0 !important;
-            transition: top 0.2s ease !important;
+            transition: top 0.32s cubic-bezier(0.22,1,0.36,1), box-shadow 0.2s ease, transform 0.2s ease !important;
+            animation: sdmEnter 420ms cubic-bezier(0.22,1,0.36,1) backwards !important;
+        }
+        /* backwards, not both: once the entrance has played the element goes back to
+           its normal styles, which is what lets :hover move it at all. */
+        @keyframes sdmEnter {
+            from { opacity: 0; transform: translateX(26px) scale(0.965); }
+            to   { opacity: 1; transform: none; }
+        }
+        @keyframes sdmLeave {
+            to { opacity: 0; transform: translateX(18px) scale(0.97); }
+        }
+        .sdmPopup.sdmLeaving { animation: sdmLeave 200ms ease forwards !important; pointer-events: none !important; }
+        .sdmPopup:hover {
+            transform: translateY(-1px) !important;
+            box-shadow:
+                0 1px 2px rgba(15,23,42,0.06),
+                0 10px 18px -6px rgba(15,23,42,0.14),
+                0 26px 44px -18px rgba(15,23,42,0.28),
+                inset 0 1px 0 var(--sdm-highlight) !important;
+        }
+        /* The accent rail: inset and rounded rather than a full-height border, with a
+           glow so it carries at the edge of vision. */
+        .sdmPopup::before {
+            content: "" !important;
+            position: absolute !important; left: 0 !important; top: 10px !important; bottom: 12px !important;
+            width: 3px !important; border-radius: 0 3px 3px 0 !important;
+            background-image: linear-gradient(180deg, var(--sdm-accent-soft), var(--sdm-accent)) !important;
+            box-shadow: 0 0 10px -1px var(--sdm-accent-glow) !important;
         }
         @media (prefers-color-scheme: dark) {
             .sdmPopup {
-                --sdm-surface: #151a21;
-                --sdm-border: rgba(255,255,255,0.12);
-                --sdm-text: #e6e9ef;
-                --sdm-muted: #9aa4b2;
-                --sdm-btn: #e6e9ef;
+                --sdm-surface-a: rgba(30,37,48,0.97);
+                --sdm-surface-b: rgba(20,25,33,0.97);
+                --sdm-border: rgba(255,255,255,0.10);
+                --sdm-highlight: rgba(255,255,255,0.07);
+                --sdm-text: #e8ecf2;
+                --sdm-muted: #98a3b3;
+                --sdm-btn-a: #f1f5f9;
+                --sdm-btn-b: #dbe2ea;
                 --sdm-btn-text: #0f172a;
-                --sdm-ghost-border: rgba(255,255,255,0.18);
-                --sdm-track: rgba(255,255,255,0.12);
-                box-shadow: 0 1px 2px rgba(0,0,0,0.4), 0 12px 28px -8px rgba(0,0,0,0.6) !important;
+                --sdm-hairline: rgba(255,255,255,0.16);
+                --sdm-track: rgba(255,255,255,0.10);
+                box-shadow:
+                    0 1px 2px rgba(0,0,0,0.35),
+                    0 8px 18px -6px rgba(0,0,0,0.5),
+                    0 24px 44px -18px rgba(0,0,0,0.65),
+                    inset 0 1px 0 var(--sdm-highlight) !important;
             }
         }
-        /* The accent tracks urgency, not priority: everything here is inside an SLA
-           countdown, so a P4 does not get to look calm. Priority colours its own chip. */
-        .sdmPopup.sdmAcked { --sdm-accent: #059669; }
-        .sdmPopup.sdmP1 { --sdm-prio: #dc2626; }
-        .sdmPopup.sdmP2 { --sdm-prio: #ea580c; }
-        .sdmPopup.sdmP3 { --sdm-prio: #ca8a04; }
+        /* Urgency owns the accent -- everything here is inside an SLA countdown, so a
+           P4 does not get to look calm. Priority colours its own chip instead. */
+        .sdmPopup.sdmP1 { --sdm-prio-a: #ef4444; --sdm-prio-b: #b91c1c; }
+        .sdmPopup.sdmP2 { --sdm-prio-a: #f97316; --sdm-prio-b: #c2410c; }
+        .sdmPopup.sdmP3 { --sdm-prio-a: #eab308; --sdm-prio-b: #a16207; }
+        .sdmPopup.sdmAcked {
+            --sdm-accent: #059669; --sdm-accent-soft: #34d399; --sdm-accent-glow: rgba(5,150,105,0.30);
+            --sdm-surface-a: rgba(240,253,248,0.99); --sdm-surface-b: rgba(248,252,250,0.99);
+        }
+        @media (prefers-color-scheme: dark) {
+            .sdmPopup.sdmAcked { --sdm-surface-a: rgba(22,42,36,0.97); --sdm-surface-b: rgba(18,28,26,0.97); }
+        }
+        /* Under 30s the whole card is lit, not just the digits -- peripheral vision
+           reads a change in the object long before it reads four characters. */
+        .sdmPopup.sdmHot { animation: sdmEnter 420ms cubic-bezier(0.22,1,0.36,1) backwards, sdmBreathe 2.2s ease-in-out 420ms infinite !important; }
+        @keyframes sdmBreathe {
+            0%, 100% { box-shadow: 0 1px 2px rgba(15,23,42,0.05), 0 6px 12px -4px rgba(15,23,42,0.10), 0 18px 32px -14px rgba(15,23,42,0.22), 0 0 0 0 rgba(225,29,72,0), inset 0 1px 0 var(--sdm-highlight); }
+            50%      { box-shadow: 0 1px 2px rgba(15,23,42,0.05), 0 6px 12px -4px rgba(15,23,42,0.10), 0 18px 34px -14px rgba(225,29,72,0.34), 0 0 0 3px rgba(225,29,72,0.10), inset 0 1px 0 var(--sdm-highlight); }
+        }
 
-        .sdmPopup .sdmHead { display: flex !important; align-items: center !important; gap: 8px !important; margin: 0 0 5px 0 !important; }
+        .sdmPopup .sdmHead { display: flex !important; align-items: center !important; gap: 7px !important; margin: 0 !important; }
         .sdmPopup .sdmPrio {
-            font-size: 10px !important; font-weight: 700 !important; letter-spacing: 0.05em !important;
-            color: #ffffff !important; background: var(--sdm-prio) !important;
+            font-size: 9.5px !important; font-weight: 800 !important; letter-spacing: 0.06em !important;
+            color: #ffffff !important;
+            background-image: linear-gradient(180deg, var(--sdm-prio-a), var(--sdm-prio-b)) !important;
             border-radius: 4px !important; padding: 2px 5px !important; margin: 0 !important;
             flex: 0 0 auto !important; line-height: 1.3 !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.25), 0 1px 2px rgba(15,23,42,0.18) !important;
+            text-shadow: 0 1px 1px rgba(0,0,0,0.18) !important;
         }
         .sdmPopup .sdmNum {
-            font-size: 13.5px !important; font-weight: 650 !important; letter-spacing: -0.01em !important;
+            font-size: 13px !important; font-weight: 650 !important; letter-spacing: -0.01em !important;
             color: var(--sdm-text) !important; flex: 1 1 auto !important; min-width: 0 !important;
             overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important;
         }
+        .sdmPopup .sdmTime {
+            flex: 0 0 auto !important;
+            font-size: 13.5px !important; font-weight: 700 !important; letter-spacing: 0.01em !important;
+            font-variant-numeric: tabular-nums !important; font-feature-settings: "tnum" 1 !important;
+            color: var(--sdm-muted) !important;
+            transition: color 0.3s ease !important;
+        }
+        .sdmPopup .sdmTime.sdmUrgent { color: var(--sdm-accent) !important; text-shadow: 0 0 14px var(--sdm-accent-glow) !important; }
+        .sdmPopup .sdmTime.sdmOver {
+            font-size: 10.5px !important; font-weight: 800 !important; letter-spacing: 0.09em !important;
+            color: #ffffff !important; background-image: linear-gradient(180deg, var(--sdm-accent-soft), var(--sdm-accent)) !important;
+            border-radius: 4px !important; padding: 2px 6px !important;
+            box-shadow: 0 1px 6px var(--sdm-accent-glow) !important;
+            animation: sdmFade 1.6s ease-in-out infinite !important;
+        }
+        @keyframes sdmFade { 50% { opacity: 0.55; } }
+        .sdmPopup .sdmTimerLabel { display: none !important; }
+
+        .sdmPopup .sdmDesc {
+            font-size: 11.5px !important; color: var(--sdm-muted) !important; margin: 2px 0 8px 0 !important;
+            overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important;
+        }
+
+        .sdmPopup .sdmActions { display: flex !important; gap: 6px !important; }
+        .sdmPopup .sdmBtn {
+            flex: 1 1 auto !important; height: 26px !important; padding: 0 12px !important; margin: 0 !important;
+            background-image: linear-gradient(180deg, var(--sdm-btn-a), var(--sdm-btn-b)) !important;
+            color: var(--sdm-btn-text) !important;
+            border: 1px solid transparent !important; border-radius: 7px !important;
+            font-family: inherit !important; font-size: 11.5px !important; font-weight: 650 !important; line-height: 1 !important;
+            letter-spacing: 0.005em !important; text-align: center !important; cursor: pointer !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.12), 0 1px 2px rgba(15,23,42,0.18) !important;
+            transition: filter 0.15s ease, transform 0.08s ease !important;
+            position: relative !important;
+        }
+        .sdmPopup .sdmBtn:hover { filter: brightness(1.14) !important; }
+        .sdmPopup .sdmBtn:active { transform: translateY(0.5px) scale(0.995) !important; }
+        .sdmPopup .sdmBtn:disabled { opacity: 0.55 !important; cursor: default !important; filter: none !important; }
+        .sdmPopup .sdmGhost {
+            flex: 0 0 auto !important; background-image: none !important; background: transparent !important;
+            color: var(--sdm-muted) !important; border-color: var(--sdm-hairline) !important;
+            box-shadow: none !important;
+        }
+        .sdmPopup .sdmGhost:hover { background: var(--sdm-track) !important; color: var(--sdm-text) !important; filter: none !important; }
+        /* Acknowledging is a round trip through a real form -- it can take seconds, and
+           a button that just greys out looks broken while it works. */
+        .sdmPopup .sdmBtn.sdmBusy { color: transparent !important; }
+        .sdmPopup .sdmBtn.sdmBusy::after {
+            content: "" !important; position: absolute !important; top: 50% !important; left: 50% !important;
+            width: 12px !important; height: 12px !important; margin: -6px 0 0 -6px !important;
+            border: 2px solid rgba(255,255,255,0.30) !important; border-top-color: var(--sdm-btn-text) !important;
+            border-radius: 50% !important; animation: sdmSpin 0.6s linear infinite !important;
+        }
+        @keyframes sdmSpin { to { transform: rotate(360deg); } }
+
+        /* The timer as the card's bottom edge: full-width, always in the same place,
+           costing no height at all. */
+        .sdmPopup .sdmTrack {
+            position: absolute !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+            height: 3px !important; margin: 0 !important; background: var(--sdm-track) !important; overflow: hidden !important;
+        }
+        .sdmPopup .sdmFill {
+            height: 100% !important; width: var(--sdm-progress, 100%) !important;
+            background-image: linear-gradient(90deg, var(--sdm-accent-soft), var(--sdm-accent)) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.25) !important;
+            transition: width 1s linear !important;
+            position: relative !important;
+        }
+        .sdmPopup.sdmHot .sdmFill::after {
+            content: "" !important; position: absolute !important; top: 0 !important; bottom: 0 !important; left: 0 !important; right: 0 !important;
+            background-image: linear-gradient(90deg, transparent, rgba(255,255,255,0.6), transparent) !important;
+            animation: sdmSweep 1.8s ease-in-out infinite !important;
+        }
+        @keyframes sdmSweep { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+
+        .sdmPopup .sdmError { font-size: 11px !important; line-height: 1.4 !important; color: var(--sdm-accent) !important; margin: 7px 0 0 0 !important; }
+
+        .sdmPopup .sdmDone { display: flex !important; align-items: center !important; gap: 8px !important; margin: 5px 0 9px 0 !important; }
+        .sdmPopup .sdmCheck {
+            width: 19px !important; height: 19px !important; flex: 0 0 auto !important;
+            border-radius: 50% !important;
+            background-image: linear-gradient(180deg, var(--sdm-accent-soft), var(--sdm-accent)) !important;
+            box-shadow: 0 2px 8px -1px var(--sdm-accent-glow), inset 0 1px 0 rgba(255,255,255,0.3) !important;
+            color: #ffffff !important;
+            font-size: 11px !important; font-weight: 700 !important; line-height: 19px !important; text-align: center !important;
+            animation: sdmPop 420ms cubic-bezier(0.34,1.56,0.64,1) backwards !important;
+        }
+        @keyframes sdmPop { from { transform: scale(0.3); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+        .sdmPopup .sdmDoneText { font-size: 12px !important; color: var(--sdm-text) !important; min-width: 0 !important; }
         .sdmPopup .sdmClose {
-            flex: 0 0 auto !important; width: 20px !important; height: 20px !important; padding: 0 !important; margin: 0 !important;
+            flex: 0 0 auto !important; width: 19px !important; height: 19px !important; padding: 0 !important; margin: 0 !important;
             border: none !important; background: transparent !important; box-shadow: none !important;
-            color: var(--sdm-muted) !important; font-size: 15px !important; line-height: 1 !important;
-            cursor: pointer !important; border-radius: 4px !important; opacity: 0.7 !important;
+            color: var(--sdm-muted) !important; font-size: 14px !important; line-height: 1 !important;
+            cursor: pointer !important; border-radius: 5px !important; opacity: 0.6 !important;
+            transition: opacity 0.15s ease, background 0.15s ease !important;
         }
         .sdmPopup .sdmClose:hover { opacity: 1 !important; background: var(--sdm-track) !important; }
 
-        .sdmPopup .sdmDesc {
-            font-size: 12.5px !important; color: var(--sdm-muted) !important; margin: 0 0 10px 0 !important;
-            display: -webkit-box !important; -webkit-line-clamp: 2 !important; -webkit-box-orient: vertical !important;
-            overflow: hidden !important;
+        /* Anyone who has asked their system to calm down gets the layout, not the show. */
+        @media (prefers-reduced-motion: reduce) {
+            .sdmPopup, .sdmPopup *, .sdmPopup::before, .sdmPopup .sdmFill::after {
+                animation: none !important;
+                transition: none !important;
+            }
         }
-
-        .sdmPopup .sdmTimerRow { display: flex !important; align-items: baseline !important; justify-content: space-between !important; gap: 8px !important; margin: 0 0 5px 0 !important; }
-        .sdmPopup .sdmTimerLabel { font-size: 10px !important; font-weight: 600 !important; letter-spacing: 0.07em !important; text-transform: uppercase !important; color: var(--sdm-muted) !important; }
-        /* Tabular figures: without them the countdown visibly jitters every second as
-           glyph widths change, which is the sort of detail that reads as unfinished. */
-        .sdmPopup .sdmTime {
-            font-size: 17px !important; font-weight: 700 !important; letter-spacing: 0.01em !important;
-            font-variant-numeric: tabular-nums !important; font-feature-settings: "tnum" 1 !important;
-            color: var(--sdm-text) !important;
-        }
-        .sdmPopup .sdmTime.sdmUrgent { color: var(--sdm-accent) !important; }
-        .sdmPopup .sdmTime.sdmOver { color: var(--sdm-accent) !important; font-size: 13.5px !important; letter-spacing: 0.06em !important; animation: sdmFade 1.4s ease-in-out infinite !important; }
-        @keyframes sdmFade { 50% { opacity: 0.45; } }
-        .sdmPopup .sdmTrack { height: 3px !important; margin: 0 0 12px 0 !important; border-radius: 2px !important; background: var(--sdm-track) !important; overflow: hidden !important; }
-        /* Width comes through a custom property, not an inline style: every visual
-           rule here is !important to survive the host page, and an inline width can
-           never override its own !important declaration. The variable can. */
-        .sdmPopup .sdmFill { height: 100% !important; width: var(--sdm-progress, 100%) !important; background: var(--sdm-accent) !important; border-radius: 2px !important; transition: width 1s linear !important; }
-
-        .sdmPopup .sdmActions { display: flex !important; gap: 8px !important; }
-        .sdmPopup .sdmBtn {
-            flex: 1 1 auto !important; height: 32px !important; padding: 0 12px !important; margin: 0 !important;
-            background: var(--sdm-btn) !important; color: var(--sdm-btn-text) !important;
-            border: 1px solid transparent !important; border-radius: 6px !important;
-            font-family: inherit !important; font-size: 12.5px !important; font-weight: 600 !important; line-height: 1 !important;
-            text-align: center !important; cursor: pointer !important; box-shadow: none !important;
-            transition: opacity 0.15s ease !important;
-        }
-        .sdmPopup .sdmBtn:hover { opacity: 0.85 !important; }
-        .sdmPopup .sdmBtn:disabled { opacity: 0.45 !important; cursor: default !important; }
-        .sdmPopup .sdmGhost {
-            flex: 0 0 auto !important; background: transparent !important;
-            color: var(--sdm-muted) !important; border-color: var(--sdm-ghost-border) !important;
-        }
-        .sdmPopup .sdmGhost:hover { background: var(--sdm-track) !important; opacity: 1 !important; }
-
-        .sdmPopup .sdmError { font-size: 11.5px !important; line-height: 1.4 !important; color: var(--sdm-accent) !important; margin: 8px 0 0 0 !important; }
-
-        .sdmPopup .sdmDone { display: flex !important; align-items: center !important; gap: 8px !important; margin: 0 0 10px 0 !important; }
-        .sdmPopup .sdmCheck {
-            width: 18px !important; height: 18px !important; flex: 0 0 auto !important;
-            border-radius: 50% !important; background: var(--sdm-accent) !important; color: #ffffff !important;
-            font-size: 11px !important; font-weight: 700 !important; line-height: 18px !important; text-align: center !important;
-        }
-        .sdmPopup .sdmDoneText { font-size: 12.5px !important; color: var(--sdm-text) !important; min-width: 0 !important; }
 
         #sdmStatusIndicator, #sdmStatusIndicator * {
             box-sizing: border-box !important;
@@ -1110,7 +1240,11 @@
         if (popup._closeTimer) clearTimeout(popup._closeTimer);
         if (popup._ackRequestTimeout) clearTimeout(popup._ackRequestTimeout);
         popupsBySysId.delete(sysId);
-        popup.remove();
+        // Out of the map immediately so the stack closes the gap straight away, but
+        // left in the DOM long enough to animate out. A popup vanishing mid-blink is
+        // what makes an interface feel like it glitched.
+        popup.classList.add('sdmLeaving');
+        setTimeout(() => popup.remove(), 220);
         relayoutPopups();
     }
 
@@ -1167,7 +1301,13 @@
         openBtn.textContent = 'Open ticket';
         actions.append(openBtn);
 
-        popup.append(head, done, actions);
+        const doneTrack = document.createElement('div');
+        doneTrack.className = 'sdmTrack';
+        const doneFill = document.createElement('div');
+        doneFill.className = 'sdmFill';
+        doneTrack.append(doneFill);
+
+        popup.append(head, done, actions, doneTrack);
 
         closeBtn.addEventListener('click', () => {
             removePopup(ticket.sys_id);
@@ -1185,7 +1325,7 @@
         if (popup._ackRequestTimeout) clearTimeout(popup._ackRequestTimeout);
         const ackBtn = popup.querySelector('.sdmAckBtn');
         const errorEl = popup.querySelector('.sdmError');
-        if (ackBtn) { ackBtn.disabled = false; ackBtn.textContent = 'Acknowledge'; }
+        if (ackBtn) { ackBtn.disabled = false; ackBtn.classList.remove('sdmBusy'); }
         if (errorEl) { errorEl.textContent = `❌ ${message}`; errorEl.style.display = 'block'; }
         relayoutPopups();
     }
@@ -1213,23 +1353,20 @@
         num.className = 'sdmNum';
         num.textContent = ticket.number;
 
-        head.append(prio, num);
+        // The clock sits on the header line rather than in a row of its own: it is
+        // the same glance as the ticket number, and it saves the popup a whole line.
+        const countdownEl = document.createElement('span');
+        countdownEl.className = 'sdmTime';
+
+        head.append(prio, num, countdownEl);
 
         const desc = document.createElement('div');
         desc.className = 'sdmDesc';
         desc.textContent = ticket.short_desc;
 
-        const timerRow = document.createElement('div');
-        timerRow.className = 'sdmTimerRow';
-        const timerLabel = document.createElement('span');
-        timerLabel.className = 'sdmTimerLabel';
-        timerLabel.textContent = 'Acknowledge within';
-        const countdownEl = document.createElement('span');
-        countdownEl.className = 'sdmTime';
-        timerRow.append(timerLabel, countdownEl);
-
-        // The bar says at a glance how much of the window is gone — readable from
-        // across a desk in a way that four digits are not.
+        // The remaining time as the card's bottom edge — always in the same place,
+        // readable from across a desk in a way four digits are not, and costing no
+        // height at all.
         const track = document.createElement('div');
         track.className = 'sdmTrack';
         const fill = document.createElement('div');
@@ -1254,7 +1391,7 @@
         errorEl.className = 'sdmError';
         errorEl.style.display = 'none';
 
-        popup.append(head, desc, timerRow, track, actions, errorEl);
+        popup.append(head, desc, actions, errorEl, track);
         document.body.appendChild(popup);
         popupsBySysId.set(ticket.sys_id, popup);
         if (playSound) playAlertSound();
@@ -1270,7 +1407,9 @@
                 countdownEl.textContent = 'OVERDUE';
                 countdownEl.classList.remove('sdmUrgent');
                 countdownEl.classList.add('sdmOver');
-                timerLabel.textContent = 'SLA breached';
+                // The card stops breathing once the deadline is gone: the badge takes
+                // over, and a pulse nobody can act on any more is just noise.
+                popup.classList.remove('sdmHot');
                 fill.style.setProperty('--sdm-progress', '0%');
                 if (popup._countdownTimer) {
                     clearInterval(popup._countdownTimer);
@@ -1282,6 +1421,7 @@
             const ss = String(remaining % 60).padStart(2, '0');
             countdownEl.textContent = `${mm}:${ss}`;
             countdownEl.classList.toggle('sdmUrgent', remaining <= 30);
+            popup.classList.toggle('sdmHot', remaining <= 30);
             fill.style.setProperty('--sdm-progress', `${Math.max(0, Math.min(100, (remaining / total) * 100))}%`);
         }
         renderCountdown();
@@ -1301,7 +1441,7 @@
                     return;
                 }
                 ackBtn.disabled = true;
-                ackBtn.textContent = 'Acknowledging...';
+                ackBtn.classList.add('sdmBusy');
                 inFlightAckSysIds.add(ticket.sys_id);
                 try {
                     await acknowledgeTicket(ticket.table, ticket.sys_id, myId);
@@ -1312,7 +1452,7 @@
                     publishEvent({ type: 'TICKET_ACKED', ticket, ackedBy: myName });
                 } catch (err) {
                     ackBtn.disabled = false;
-                    ackBtn.textContent = 'Acknowledged';
+                    ackBtn.classList.remove('sdmBusy');
                     errorEl.textContent = `❌ ${err.message}`;
                     errorEl.style.display = 'block';
                     relayoutPopups();
@@ -1323,7 +1463,7 @@
             } else {
                 // Mirror tab: can't act directly (no session/CSRF here) — relay to a SNOW tab.
                 ackBtn.disabled = true;
-                ackBtn.textContent = 'Acknowledging...';
+                ackBtn.classList.add('sdmBusy');
                 publishEvent({ type: 'ACK_REQUEST', ticket });
                 popup._ackRequestTimeout = setTimeout(() => {
                     handleAckError(ticket.sys_id, 'No open ServiceNow tab responded. Open SNOW and try again.');
