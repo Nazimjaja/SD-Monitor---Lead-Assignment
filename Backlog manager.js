@@ -1,8 +1,19 @@
 // ==UserScript==
 // @name         SD Monitor - Lead Assignment Dashboard
 // @namespace    geodis-sd-monitor
-// @version      0.4
+// @version      0.5
 // @description  Assign unassigned CORP-SD tickets to agents and track how many you've assigned this shift
+// @changelog    0.5 - Authentication fix: the browser no longer prompts for credentials. Requests
+//                     ride the SSO session cookies as before, but they now also carry the session
+//                     token (g_ck) that ServiceNow requires alongside the cookie — reads sent none
+//                     at all and writes sent an empty one, and SNOW answers a failed token check
+//                     with 401 + WWW-Authenticate: BASIC, which is what raised the browser's native
+//                     login box. The token is read from all the places g_ck lives (UI16 global,
+//                     Next Experience, sysparm_ck field) and scraped from a page as a last resort,
+//                     rather than degrading to ''. An expired session is now recognised — both the
+//                     401 and the SSO redirect to a login page, which used to arrive as a 200 full
+//                     of HTML and surface as a JSON parse error — and it stops the poll instead of
+//                     re-triggering the prompt every 20s, showing a Reconnect bar instead.
 // @changelog    0.4 - The away list is now date-stamped like the shift counters, so it clears at
 //                     local midnight instead of carrying yesterday's marks into a new day. The
 //                     undo bar auto-hides UNDO_WINDOW_MS after an assignment and drops the slot
@@ -77,23 +88,156 @@
         PANEL_WIDTH: 340
     };
 
-    // ─── SNOW HELPERS (same approach as the ACK monitor script) ─────────────
-    function getCsrfToken() { return pageWindow.g_ck || ''; }
+    // ─── SESSION / AUTHENTICATION ───────────────────────────────────────────
+    // Everything here rides the browser's existing SSO session — we never ask for
+    // credentials and never send an Authorization header. But a session cookie on its
+    // own is NOT enough: ServiceNow rejects a session-authenticated API call that
+    // arrives without the session token (g_ck) in X-UserToken, and it answers that
+    // rejection with "401 + WWW-Authenticate: BASIC". That header is what makes the
+    // browser throw up its native username/password dialog — a box no SSO login can
+    // ever satisfy. So a missing token doesn't fail quietly, it pops a credential
+    // prompt, and a poll on a timer re-provokes it every cycle forever.
+    //
+    // Two rules follow, and every request below obeys them:
+    //   1. Always send a real token. Never send an empty one — SNOW treats
+    //      X-UserToken: '' as a *failed* token check, which is worse than anonymous.
+    //   2. On the first genuine auth failure, stop. One dialog is a bug report;
+    //      one dialog every POLL_MS is unusable.
+    class SessionError extends Error {
+        constructor(message) { super(message); this.name = 'SessionError'; }
+    }
 
+    let sessionToken = null;
+    let sessionTokenPromise = null;
+    let sessionBroken = false;
+
+    // Where g_ck lives depends on which UI you're on: a global in UI16, hung off the
+    // NOW namespace in Next Experience, and in a hidden form field on plain .do pages.
+    // Checking all of them is why this no longer silently degrades to an empty token.
+    function tokenFromPageWindow() {
+        const w = pageWindow;
+        const field = document.querySelector('input[name="sysparm_ck"]');
+        const candidates = [
+            w.g_ck,
+            w.NOW && w.NOW.g_ck,
+            w.NOW && w.NOW.session && w.NOW.session.token,
+            w.g_sysparm_ck,
+            field && field.value
+        ];
+        return candidates.find(v => typeof v === 'string' && v.length >= 32) || null;
+    }
+
+    // Fallback for UIs that expose g_ck nowhere reachable: scrape it out of a page
+    // fetched with the session cookies. Deliberately a bare fetch — it must not route
+    // through snFetch, which would need a token to run and recurse.
+    async function tokenFromBlankPage() {
+        const r = await fetch('/blank.do', { credentials: 'same-origin', cache: 'no-store' });
+        if (!r.ok) return null;
+        const text = await r.text();
+        const m = /(?:var\s+g_ck\s*=|["']g_ck["']\s*:)\s*["']([^"']{32,})["']/.exec(text);
+        return m ? m[1] : null;
+    }
+
+    async function getSessionToken(forceRefresh = false) {
+        if (sessionToken && !forceRefresh) return sessionToken;
+        const direct = tokenFromPageWindow();
+        if (direct) { sessionToken = direct; return sessionToken; }
+        if (!sessionTokenPromise) {
+            sessionTokenPromise = tokenFromBlankPage()
+                .catch(() => null)
+                .then(t => { sessionToken = t; return t; })
+                .finally(() => { sessionTokenPromise = null; });
+        }
+        return sessionTokenPromise;
+    }
+
+    // A dead SSO session usually arrives as a redirect to the IdP rather than a 401,
+    // which means a 200 carrying HTML. Without this the response reaches r.json() and
+    // surfaces as an unexplained "Unexpected token <" instead of "sign in again".
+    function looksLikeLoginPage(text) {
+        return /<form[^>]+login\.do/i.test(text)
+            || /name=["']sysparm_login/i.test(text)
+            || /SAMLRequest/i.test(text)
+            || /<title>[^<]*(sign in|log ?in)/i.test(text);
+    }
+
+    function markSessionBroken(reason) {
+        if (sessionBroken) return;
+        sessionBroken = true;
+        sessionToken = null;
+        stopPolling();
+        showSessionBanner(reason);
+    }
+
+    // Single funnel for every ServiceNow call, so the cookie/token/redirect handling
+    // can't drift apart between the read and write paths again.
+    async function snFetch(path, { method = 'GET', body = null, headers = {} } = {}) {
+        if (sessionBroken) {
+            throw new SessionError('Paused — the ServiceNow session needs re-authenticating.');
+        }
+
+        const send = token => {
+            const h = Object.assign({
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                // Ask SNOW to answer an expired session with a 401 body instead of
+                // 302-ing us into the SSO login flow. Following that redirect chain is
+                // both how we ended up parsing HTML as JSON and an extra opportunity
+                // for an auth challenge to reach the browser.
+                'X-No-Response-Redirect': 'true'
+            }, headers);
+            if (token) h['X-UserToken'] = token; // rule 1: never an empty token
+            return fetch(path, {
+                method,
+                headers: h,
+                body,
+                // The SSO session cookies are the entire authentication story here.
+                // fetch() already defaults to same-origin, but state it so nobody
+                // "tidies" this into a credential-less request later.
+                credentials: 'same-origin',
+                cache: 'no-store',
+                redirect: 'follow'
+            });
+        };
+
+        const token = await getSessionToken();
+        let r = await send(token);
+
+        // A rejected token is recoverable — the page may have been open across a
+        // session renewal — so re-read g_ck and retry exactly once. A second failure
+        // means the session itself is gone, and retrying on a timer from there is what
+        // produced a credential dialog every few seconds.
+        if (r.status === 401 || r.status === 403) {
+            const fresh = await getSessionToken(true);
+            if (fresh && fresh !== token) r = await send(fresh);
+        }
+        if (r.status === 401 || r.status === 403 || r.headers.get('X-Is-Logged-In') === 'false') {
+            markSessionBroken(`ServiceNow rejected the request (HTTP ${r.status}).`);
+            throw new SessionError('Not signed in to ServiceNow, or the session token is no longer valid.');
+        }
+
+        if (r.ok && !/json/i.test(r.headers.get('content-type') || '')) {
+            const text = await r.text();
+            if (looksLikeLoginPage(text)) {
+                markSessionBroken('ServiceNow answered with a sign-in page.');
+                throw new SessionError('The ServiceNow session has expired — SSO returned its login page.');
+            }
+            throw new Error(`Expected JSON from ${path}, got ${r.headers.get('content-type') || 'no content-type'}.`);
+        }
+        return r;
+    }
+
+    // ─── SNOW HELPERS (same approach as the ACK monitor script) ─────────────
     async function jFetch(table, query, limit = 20) {
-        const r = await fetch(`/${table}_list.do?JSONv2&sysparm_action=getRecords&sysparm_query=${query}&sysparm_limit=${limit}`);
+        const r = await snFetch(`/${table}_list.do?JSONv2&sysparm_action=getRecords&sysparm_query=${query}&sysparm_limit=${limit}`);
         if (!r.ok) throw new Error(`${table}: HTTP ${r.status}`);
         return (await r.json()).records || [];
     }
 
     async function assignRecord(table, sysId, userId) {
-        const r = await fetch(`/api/now/table/${table}/${sysId}`, {
+        const r = await snFetch(`/api/now/table/${table}/${sysId}`, {
             method: 'PATCH',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'X-UserToken': getCsrfToken()
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ assigned_to: userId })
         });
         if (!r.ok) throw new Error(`HTTP ${r.status} — ${(await r.text()).slice(0, 120)}`);
@@ -117,13 +261,9 @@
     // Undo path: put the ticket back in the unassigned queue. Same silent-drop risk as
     // assignRecord, so verify the field actually came back empty.
     async function clearAssignment(table, sysId) {
-        const r = await fetch(`/api/now/table/${table}/${sysId}`, {
+        const r = await snFetch(`/api/now/table/${table}/${sysId}`, {
             method: 'PATCH',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'X-UserToken': getCsrfToken()
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ assigned_to: '' })
         });
         if (!r.ok) throw new Error(`HTTP ${r.status} — ${(await r.text()).slice(0, 120)}`);
@@ -140,9 +280,8 @@
         for (const table of CONFIG.TABLES) {
             let query = `assignment_group=${groupSysId}^active=true^assigned_toISNOTEMPTY`;
             if (CONFIG.EXTRA_FILTER[table]) query += `^${CONFIG.EXTRA_FILTER[table]}`;
-            const r = await fetch(
-                `/api/now/stats/${table}?sysparm_query=${query}&sysparm_count=true&sysparm_group_by=assigned_to`,
-                { headers: { Accept: 'application/json' } }
+            const r = await snFetch(
+                `/api/now/stats/${table}?sysparm_query=${query}&sysparm_count=true&sysparm_group_by=assigned_to`
             );
             if (!r.ok) throw new Error(`load ${table}: HTTP ${r.status}`);
             const rows = (await r.json())?.result || [];
@@ -381,6 +520,10 @@
         .sdaRosterLoad.sdaLightest { background: rgba(46,125,50,0.16) !important; color: #1f6b28 !important; font-weight: 700 !important; }
         .sdaAge { font-size: 11px !important; color: rgba(26,26,46,0.55) !important; }
         .sdaAge.sdaAgeWarn { color: #b3261e !important; font-weight: 700 !important; }
+        .sdaAuthBar { display: none; align-items: center !important; justify-content: space-between !important; gap: 8px !important; font-size: 11.5px !important; background: rgba(229,72,77,0.12) !important; border: 1px solid rgba(229,72,77,0.35) !important; border-radius: 8px !important; padding: 7px 9px !important; margin-bottom: 10px !important; color: #b3261e !important; }
+        .sdaAuthText { min-width: 0 !important; }
+        .sdaAuthBtn { border: none !important; border-radius: 6px !important; background: #b3261e !important; color: #fff !important; font-size: 11px !important; padding: 4px 10px !important; margin: 0 !important; cursor: pointer !important; flex: 0 0 auto !important; box-shadow: none !important; }
+        .sdaAuthBtn:disabled { opacity: 0.5 !important; cursor: default !important; }
         .sdaUndoBar { display: none; align-items: center !important; justify-content: space-between !important; gap: 8px !important; font-size: 11.5px !important; background: rgba(59,130,246,0.10) !important; border-radius: 8px !important; padding: 6px 9px !important; margin-bottom: 8px !important; }
         .sdaUndoText { overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important; }
         .sdaUndoBtn { border: none !important; border-radius: 6px !important; background: #3b82f6 !important; color: #fff !important; font-size: 11px !important; padding: 3px 9px !important; margin: 0 !important; cursor: pointer !important; flex: 0 0 auto !important; box-shadow: none !important; }
@@ -558,6 +701,10 @@
                 </div>
             </div>
             <div class="sdaBody" id="sdaBody">
+                <div class="sdaAuthBar" id="sdaAuthBar">
+                    <span class="sdaAuthText" id="sdaAuthText"></span>
+                    <button class="sdaAuthBtn" id="sdaAuthBtn">Reconnect</button>
+                </div>
                 <div class="sdaSection">
                     <div class="sdaSectionHead">
                         <span>Assigned today (<span id="sdaShiftDate"></span>)</span>
@@ -584,7 +731,12 @@
 
         document.body.appendChild(panel);
 
-        panel.querySelector('#sdaRefreshBtn').addEventListener('click', pollUnassigned);
+        // While the session is broken a refresh would only throw — retry the sign-in
+        // instead, which is what you actually want from that button in that state.
+        panel.querySelector('#sdaRefreshBtn').addEventListener('click', () => {
+            if (sessionBroken) reconnectSession(); else pollUnassigned();
+        });
+        panel.querySelector('#sdaAuthBtn').addEventListener('click', reconnectSession);
         panel.querySelector('#sdaUndoBtn').addEventListener('click', undoLastAssign);
         panel.querySelector('#sdaGearBtn').addEventListener('click', () => showAgentResolutionPanel(CONFIG.AGENTS));
         panel.querySelector('#sdaResetBtn').addEventListener('click', () => {
@@ -915,6 +1067,58 @@
         statusEl.classList.toggle('sdaError', isError);
     }
 
+    // ─── SESSION BANNER + POLL CONTROL ──────────────────────────────────────
+    // The poll interval is owned here rather than being a fire-and-forget setInterval,
+    // because stopping it is the actual fix for the credential dialog: once the session
+    // is gone every subsequent request re-triggers the browser's auth prompt, so the
+    // loop has to be able to stand down and wait for a human.
+    let pollTimer = null;
+    function startPolling() {
+        if (pollTimer || sessionBroken) return;
+        pollTimer = setInterval(pollUnassigned, CONFIG.POLL_MS);
+    }
+    function stopPolling() {
+        clearInterval(pollTimer);
+        pollTimer = null;
+    }
+
+    function showSessionBanner(reason) {
+        const bar = document.getElementById('sdaAuthBar');
+        const textEl = document.getElementById('sdaAuthText');
+        if (bar && textEl) {
+            textEl.textContent = `🔒 ${reason} Auto-refresh paused. Sign in to ServiceNow in another tab, then Reconnect.`;
+            bar.style.display = 'flex';
+        }
+        setPanelStatus('Paused — not authenticated', true);
+        console.warn('[Assign Dashboard] session lost:', reason);
+    }
+
+    function hideSessionBanner() {
+        const bar = document.getElementById('sdaAuthBar');
+        if (bar) bar.style.display = 'none';
+    }
+
+    async function reconnectSession() {
+        const btn = document.getElementById('sdaAuthBtn');
+        if (btn) { btn.disabled = true; btn.textContent = '…'; }
+        // Clear the flag first so snFetch is allowed to try again, and drop the cached
+        // token so we re-read it rather than replaying the one that was just rejected.
+        sessionBroken = false;
+        sessionToken = null;
+        setPanelStatus('Reconnecting…');
+        try {
+            const token = await getSessionToken(true);
+            if (!token) throw new Error('Could not read the ServiceNow session token (g_ck) — the SSO session looks gone.');
+            hideSessionBanner();
+            await pollUnassigned();
+            startPolling();
+        } catch (e) {
+            markSessionBroken(e.message);
+        } finally {
+            if (btn) { btn.disabled = false; btn.textContent = 'Reconnect'; }
+        }
+    }
+
     // ─── POLL ────────────────────────────────────────────────────────────────
     async function pollUnassigned() {
         setPanelStatus('Refreshing…');
@@ -951,6 +1155,9 @@
                 openLoad = await fetchOpenLoad(gid);
             } catch (e) {
                 openLoad = null;
+                // …unless it failed because we're logged out, which is not a
+                // nice-to-have and must not be swallowed into a console warning.
+                if (e instanceof SessionError) throw e;
                 console.warn('[Assign Dashboard] open-load lookup failed', e);
             }
             renderRoster();
@@ -964,6 +1171,9 @@
             lastPollMeta = { truncated, stamp };
             renderQueueStatus();
         } catch (e) {
+            // markSessionBroken has already stopped the loop and put the banner up —
+            // don't overwrite it with a generic error, and don't keep polling.
+            if (e instanceof SessionError) return;
             setPanelStatus(`Error: ${e.message}`, true);
             console.error('[Assign Dashboard] poll failed', e);
         }
@@ -978,16 +1188,32 @@
         buildPanelShell();
         renderRoster();
         setPanelStatus('Resolving agents…');
-        await ensureAgentsResolved();
+        // Warm the session token before the first request goes out, so the opening
+        // burst can't be the thing that provokes a credential prompt.
+        if (!await getSessionToken()) {
+            markSessionBroken('No ServiceNow session token found on this page.');
+            return;
+        }
+        try {
+            await ensureAgentsResolved();
+        } catch (e) {
+            if (!(e instanceof SessionError)) throw e;
+            return;
+        }
         renderRoster();
         await pollUnassigned();
-        setInterval(pollUnassigned, CONFIG.POLL_MS);
+        startPolling();
     })();
 
     // ─── DEBUG HELPERS (console) ─────────────────────────────────────────────
     window.__sdAssignDebug = {
         forcePoll: pollUnassigned,
         resetShift() { resetShiftCounts(); renderRoster(); },
-        reresolveAgents() { return showAgentResolutionPanel(CONFIG.AGENTS); }
+        reresolveAgents() { return showAgentResolutionPanel(CONFIG.AGENTS); },
+        // Auth triage: if a credential prompt ever comes back, check here first —
+        // a null token is the cause, not a symptom.
+        session() { return { token: sessionToken, broken: sessionBroken, polling: !!pollTimer }; },
+        refreshToken() { return getSessionToken(true); },
+        reconnect: reconnectSession
     };
 })();
