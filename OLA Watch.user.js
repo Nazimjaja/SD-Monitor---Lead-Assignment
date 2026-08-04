@@ -1,11 +1,23 @@
 // ==UserScript==
 // @name         SD Monitor - OLA Breach Warning
 // @namespace    geodis-sd-monitor
-// @version      0.4
+// @version      0.5
 // @description  Warns every SD agent when a group ticket's resolution OLA crosses 50% and 75%, and lets whoever is free take it over on the spot
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
+// @changelog    0.5 - __olaWatchDebug was attached to the bare `window`, which under a non-"none"
+//                     @grant (this script carries several) is Tampermonkey's isolated sandbox
+//                     window, NOT the real page's — the exact reason pageWindow exists at all,
+//                     to reach g_ck/g_user_id on the real page via unsafeWindow. The debug object
+//                     landed on the wrong one, so it worked from code running inside the script
+//                     but was invisible to anything typed directly into DevTools, which always
+//                     evaluates against the real page window. It confirmed the script itself was
+//                     loading (its console.log lines showed up fine — GM's console proxy isn't
+//                     affected by this) while making it look completely uninspectable. Now
+//                     assigned to pageWindow (== unsafeWindow) as well, so
+//                     __olaWatchDebug.dock() / .favStatus() / .state() etc. actually resolve from
+//                     the console.
 // @changelog    0.4 - This script had NO @updateURL/@downloadURL and was named OLA Watch.js —
 //                     without the .user.js suffix, Tampermonkey never offers an install prompt
 //                     for the raw GitHub link, and without an @updateURL it has no way to notice
@@ -1371,7 +1383,15 @@
     document.addEventListener('visibilitychange', () => { if (isVisible()) pollCycle(); });
 
     // ─── DEBUG / SELF-CHECK (console) ────────────────────────────────────────
-    window.__olaWatchDebug = {
+    // Assigned to pageWindow (== unsafeWindow), not the bare `window` above it.
+    // A non-"none" @grant runs this script in Tampermonkey's isolated sandbox,
+    // where `window` is a DIFFERENT object from the real page's — the exact
+    // reason pageWindow exists at all (to reach g_ck/g_user_id on the real
+    // page). window.__olaWatchDebug = {...} was reachable from code running
+    // IN the sandbox, but invisible to anything typed directly into DevTools,
+    // which always evaluates against the real page's window. Also kept on
+    // `window` for a hypothetical @grant none run, where they're the same object.
+    const debugApi = {
         forcePoll,
         state: () => getSharedState(),
         ledger: () => getLedger(),
@@ -1509,6 +1529,8 @@
             return { ok: true };
         }
     };
+    pageWindow.__olaWatchDebug = debugApi;
+    window.__olaWatchDebug = debugApi;
 
     console.log(`[OLA Watch] loaded — group ${CONFIG.ASSIGNMENT_GROUP}, OLA ${CONFIG.OLA_NAME}, thresholds ${CONFIG.THRESHOLDS.join('/')}%`);
 })();
