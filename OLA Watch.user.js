@@ -1,11 +1,19 @@
 // ==UserScript==
 // @name         SD Monitor - OLA Breach Warning
 // @namespace    geodis-sd-monitor
-// @version      0.5
+// @version      0.6
 // @description  Warns every SD agent when a group ticket's resolution OLA crosses 50% and 75%, and lets whoever is free take it over on the spot
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
+// @changelog    0.6 - The load line never printed a version — unlike the ACK monitor, which
+//                     deliberately logs its own SCRIPT_VERSION so "which version is this tab
+//                     actually running" is answerable from the console instead of memory. That
+//                     ambiguity made it impossible to tell whether a reinstall had actually taken
+//                     effect versus a stale tab still running old code. Now logs
+//                     `[OLA Watch] v${SCRIPT_VERSION} loaded on ${hostname} — ...`, read from the
+//                     installed script's own GM_info metadata so it can't drift from @version,
+//                     and __olaWatchDebug.version reports the same thing.
 // @changelog    0.5 - __olaWatchDebug was attached to the bare `window`, which under a non-"none"
 //                     @grant (this script carries several) is Tampermonkey's isolated sandbox
 //                     window, NOT the real page's — the exact reason pageWindow exists at all,
@@ -90,6 +98,15 @@
     // Sandboxed mode (any non-"none" @grant) isolates `window` from the real page,
     // and SNOW's globals (g_ck, g_user_id, NOW) live on the real page.
     const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+    // Read back from the installed script's own metadata, same reasoning as the
+    // ACK monitor's SCRIPT_VERSION: with the script auto-updating, "which
+    // version is this tab actually running" stops being answerable from memory,
+    // and a stale tab keeps running old code until it reloads. The load line
+    // below used to omit this entirely, which is exactly the ambiguity that
+    // made "did the reinstall actually take" impossible to answer from the
+    // console alone.
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '?';
 
     // ─── CONFIG ─────────────────────────────────────────────────────────────
     const CONFIG = {
@@ -1392,6 +1409,7 @@
     // which always evaluates against the real page's window. Also kept on
     // `window` for a hypothetical @grant none run, where they're the same object.
     const debugApi = {
+        version: SCRIPT_VERSION,
         forcePoll,
         state: () => getSharedState(),
         ledger: () => getLedger(),
@@ -1532,5 +1550,5 @@
     pageWindow.__olaWatchDebug = debugApi;
     window.__olaWatchDebug = debugApi;
 
-    console.log(`[OLA Watch] loaded — group ${CONFIG.ASSIGNMENT_GROUP}, OLA ${CONFIG.OLA_NAME}, thresholds ${CONFIG.THRESHOLDS.join('/')}%`);
+    console.log(`[OLA Watch] v${SCRIPT_VERSION} loaded on ${location.hostname} — group ${CONFIG.ASSIGNMENT_GROUP}, OLA ${CONFIG.OLA_NAME}, thresholds ${CONFIG.THRESHOLDS.join('/')}%`);
 })();
