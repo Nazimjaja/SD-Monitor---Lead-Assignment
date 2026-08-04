@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SD Monitor - OLA Breach Warning
 // @namespace    geodis-sd-monitor
-// @version      0.9
-// @description  Warns every SD agent when a group ticket's resolution OLA crosses 50% and 75%, and lets whoever is free take it over on the spot
+// @version      0.10
+// @description  Warns every SD agent when a group ticket's resolution OLA crosses 75%, and lets whoever is free take it over on the spot
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
@@ -62,9 +62,19 @@
         // parked tickets on screen; the percentage shown for a paused SLA is frozen.
         STAGE_FILTER: 'stage=in_progress',
 
-        // Percent-of-OLA-consumed points that raise an alert. Each fires once per
-        // ticket. Add 90 here if you want a last call before the breach.
-        THRESHOLDS: [50, 75],
+        // Percent-of-OLA-consumed points controlling three independent behaviors —
+        // deliberately split apart, since "worth listing", "genuinely urgent" and
+        // "worth interrupting someone for" are different bars and used to all be
+        // driven off the same two-element array:
+        //   SHOW_AT   — lowest pct at which a ticket enters the panel at all (Watch)
+        //   CRIT_AT   — pct at which a ticket is relabeled "Breaching soon" (red)
+        //   NOTIFY_AT — pct(s) at which a sound + OS notification actually fires.
+        //               A list, not a single number, so a later "one last call
+        //               before breach" point (e.g. 90) can be added without
+        //               restructuring anything that reads it.
+        SHOW_AT: 25,
+        CRIT_AT: 50,
+        NOTIFY_AT: [75],
 
         // 30s against a 60-minute OLA is 0.8% of the window — fine granularity, and
         // low enough load that N agents polling all day is invisible.
@@ -483,9 +493,23 @@
     function computePct(row, nowMs = Date.now()) {
         const s = parseSnowUtc(row.start);
         const e = parseSnowUtc(row.plannedEnd);
-        if (s == null || e == null || e <= s) return row.serverPct || null;
+        // Missing/unparseable timestamps on a row SNOW already reports as
+        // active/in_progress is a transient read gap, not real state — start_time
+        // is written synchronously when the SLA clock starts, so a null here means
+        // the API response's dot-walk hasn't resolved yet, not that the ticket has
+        // no start. Trusting task_sla.percentage in that gap is what let a
+        // just-created ticket flash straight to "breaching soon" while its own
+        // countdown still showed the OLA nearly untouched: percentage is a snapshot
+        // that can lag or carry a stale value from before a reset, and there was
+        // nothing here checking it against anything before showing it. Returning
+        // null instead just excludes the row until the next poll (≤30s) resolves it.
+        if (s == null || e == null || e <= s) return null;
         const totalBusinessMs = businessMsBetween(s, e);
-        if (totalBusinessMs <= 0) return row.serverPct || null; // window has no business hours in it — can't be schedule-derived
+        // Zero business hours in the window (e.g. entirely inside a holiday) is a
+        // real, stable state rather than a transient gap — serverPct is the only
+        // information available here, and there is no "wait for the next poll" that
+        // would ever produce a better answer.
+        if (totalBusinessMs <= 0) return row.serverPct || null;
         const elapsedBusinessMs = businessMsBetween(s, Math.min(nowMs, e));
         const pct = (elapsedBusinessMs / totalBusinessMs) * 100;
         return Math.min(100, Math.max(0, pct));
@@ -513,11 +537,11 @@
         return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
     }
 
-    // Highest configured threshold this row has reached, or null. Thresholds are
-    // sorted descending so the answer is the most severe one crossed, not the first.
+    // Highest configured NOTIFY_AT point this row has reached, or null. Sorted
+    // descending so the answer is the most severe one crossed, not the first.
     function crossedThreshold(pct) {
         if (pct == null) return null;
-        const sorted = [...CONFIG.THRESHOLDS].sort((a, b) => b - a);
+        const sorted = [...CONFIG.NOTIFY_AT].sort((a, b) => b - a);
         return sorted.find(t => pct >= t) ?? null;
     }
 
@@ -961,12 +985,7 @@
         body.replaceChildren();
         const myId = getMyId();
 
-        // Derived from CONFIG.THRESHOLDS, not hardcoded — the comment on
-        // THRESHOLDS itself invites adding e.g. 90 as a last-call threshold,
-        // and a hardcoded 75 here would silently keep the "Breaching soon"
-        // split at the old value instead of following that change.
-        const critAt = Math.max(...CONFIG.THRESHOLDS);
-        const isCrit = row => { const p = computePct(row); return p != null && p >= critAt; };
+        const isCrit = row => { const p = computePct(row); return p != null && p >= CONFIG.CRIT_AT; };
 
         function addGroup(label, cls, glyph, list) {
             if (!list.length) return;
@@ -1083,12 +1102,11 @@
         const gid = await resolveGroupSysId();
         const rows = await fetchOlaRows(gid);
 
-        // Only rows past the lowest configured threshold reach the panel; everything
-        // else is a healthy ticket and would just be noise.
-        const lowest = Math.min(...CONFIG.THRESHOLDS);
+        // Only rows past SHOW_AT reach the panel; everything else is a healthy
+        // ticket (or a row computePct couldn't yet trust) and would just be noise.
         const atRisk = rows.filter(row => {
             const pct = computePct(row);
-            return pct != null && pct >= lowest;
+            return pct != null && pct >= CONFIG.SHOW_AT;
         });
 
         // Fire notifications for newly crossed thresholds. This runs only on the tab
@@ -1104,11 +1122,12 @@
             const entry = ledger[row.slaSysId] || { fired: [], lastSeen: now };
             entry.lastSeen = now;
 
-            // Fire every not-yet-fired threshold at or below the current one, so a
-            // ticket that jumps past 50 straight to 75 between polls (a long tab
-            // sleep, a laptop resuming from suspend) still records both rather than
-            // leaving 50 armed to fire later.
-            CONFIG.THRESHOLDS.filter(t => t <= threshold && !entry.fired.includes(t))
+            // Fire every not-yet-fired NOTIFY_AT point at or below the current one,
+            // so a ticket that jumps past an earlier point straight to a later one
+            // between polls (a long tab sleep, a laptop resuming from suspend)
+            // still records all of them rather than leaving the earlier one armed
+            // to fire later.
+            CONFIG.NOTIFY_AT.filter(t => t <= threshold && !entry.fired.includes(t))
                 .sort((a, b) => a - b)
                 .forEach(t => {
                     // The threshold is recorded as fired even when muted — muting
@@ -1366,10 +1385,19 @@
             const onHoliday = { start: pIso(2026, 7, 14, 8, 0), plannedEnd: pIso(2026, 7, 14, 19, 0), serverPct: 42 };
             check('holiday window falls back to serverPct', computePct(onHoliday, pMs(2026, 7, 14, 12, 0)) === 42);
 
-            // Threshold selection returns the MOST severe crossed, not the first
-            check('threshold 49 → none', crossedThreshold(49) === null);
-            check('threshold 50 → 50', crossedThreshold(50) === 50);
-            check('threshold 74 → 50', crossedThreshold(74) === 50);
+            // A row with a missing/unparseable start_time (the just-created-ticket
+            // race that let a fresh SLA flash straight to "breaching soon" on a
+            // stale serverPct) must NOT fall back to serverPct — it should read as
+            // unknown (null, excluded from the panel) until the next poll resolves it.
+            const missingStart = { start: '', plannedEnd: pIso(2026, 8, 4, 11, 0), serverPct: 80 };
+            check('missing start_time does not trust serverPct', computePct(missingStart, pMs(2026, 8, 4, 10, 1)) === null);
+            const missingEnd = { start: pIso(2026, 8, 4, 10, 0), plannedEnd: '', serverPct: 80 };
+            check('missing planned_end_time does not trust serverPct', computePct(missingEnd, pMs(2026, 8, 4, 10, 1)) === null);
+
+            // Threshold selection returns the MOST severe NOTIFY_AT point crossed,
+            // not the first. NOTIFY_AT is [75] by default.
+            check('threshold 74 → none', crossedThreshold(74) === null);
+            check('threshold 75 → 75', crossedThreshold(75) === 75);
             check('threshold 99 → 75', crossedThreshold(99) === 75);
             check('threshold null → null', crossedThreshold(null) === null);
 
@@ -1394,12 +1422,12 @@
                 console.error('[OLA Watch] selfTest FAILED:', fails);
                 return { ok: false, fails };
             }
-            console.log('[OLA Watch] selfTest passed (19 checks)');
+            console.log('[OLA Watch] selfTest passed (20 checks)');
             return { ok: true };
         }
     };
     pageWindow.__olaWatchDebug = debugApi;
     window.__olaWatchDebug = debugApi;
 
-    console.log(`[OLA Watch] v${SCRIPT_VERSION} loaded on ${location.hostname} — group ${CONFIG.ASSIGNMENT_GROUP}, OLA ${CONFIG.OLA_NAME}, thresholds ${CONFIG.THRESHOLDS.join('/')}%`);
+    console.log(`[OLA Watch] v${SCRIPT_VERSION} loaded on ${location.hostname} — group ${CONFIG.ASSIGNMENT_GROUP}, OLA ${CONFIG.OLA_NAME}, show@${CONFIG.SHOW_AT}% crit@${CONFIG.CRIT_AT}% notify@${CONFIG.NOTIFY_AT.join('/')}%`);
 })();
