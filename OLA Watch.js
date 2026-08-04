@@ -898,11 +898,21 @@
         panel.style.setProperty('bottom', `${Math.round(Math.max(0, window.innerHeight - rect.bottom))}px`, 'important');
     }
 
+    // #olaPanel is display:none unless it carries .olaVisible, and the ONLY place
+    // that normally adds that class is renderPanel's own
+    // `rows.length > 0 || !!state.error` check. Several callers report a problem
+    // straight to this status line WITHOUT going through renderPanel first — no
+    // user id on the page, a broken session, the very first poll before any
+    // shared state exists — and those calls used to write into a panel that was
+    // still display:none, so the message went nowhere. An error is always worth
+    // surfacing, so it forces the panel open here rather than depending on every
+    // call site to remember to do it separately.
     function setStatus(text, isError = false) {
         const s = document.getElementById('olaStatus');
         if (!s) return;
         s.textContent = text;
         s.classList.toggle('olaErr', isError);
+        if (isError && panel) panel.classList.add('olaVisible');
     }
 
     // Rows currently rendered, so the 1s ticker can update clocks without a re-render
@@ -1191,6 +1201,15 @@
             const prev = getSharedState();
             setSharedState({ ...prev, error: e.message });
             console.error('[OLA Watch] poll failed', e);
+            // Without this, the polling tab writes the error to shared storage but
+            // never repaints itself — pollOnce's success path renders directly for
+            // exactly this reason (a tab can't rely on hearing its own GM storage
+            // write back as a value-change event), and this path was missing the
+            // same call. On a single-tab session — the common case — that meant an
+            // error made the panel go from invisible-because-nothing's-at-risk to
+            // invisible-because-broken with zero visible difference: #olaPanel stays
+            // display:none because .olaVisible is only ever added inside renderPanel.
+            if (takesInFlight === 0) renderPanel();
         } finally {
             pollInFlight = false;
         }
