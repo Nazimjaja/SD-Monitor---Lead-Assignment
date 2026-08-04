@@ -1,8 +1,32 @@
 // ==UserScript==
 // @name         SD Monitor - OLA Breach Warning
 // @namespace    geodis-sd-monitor
-// @version      0.3
+// @version      0.4
 // @description  Warns every SD agent when a group ticket's resolution OLA crosses 50% and 75%, and lets whoever is free take it over on the spot
+// @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
+// @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
+// @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
+// @changelog    0.4 - This script had NO @updateURL/@downloadURL and was named OLA Watch.js —
+//                     without the .user.js suffix, Tampermonkey never offers an install prompt
+//                     for the raw GitHub link, and without an @updateURL it has no way to notice
+//                     new versions even if manually installed once. Every fix in 0.2/0.3 may
+//                     never have reached an already-installed copy. Renamed to OLA Watch.user.js
+//                     and added the same @updateURL/@downloadURL/@homepageURL the ACK monitor
+//                     carries (it hit this exact bug once — see its history) — but note that an
+//                     existing install still needs to be removed and reinstalled from the new
+//                     raw URL ONCE, since a script with no @updateURL has nothing to check
+//                     against and can't discover this fix on its own.
+//                     Added a persistent Favorites entry — a sibling <sn-collapsible-list>
+//                     appended into the real nav body after the existing favourites, structured
+//                     the same way (a <ul class="sn-polaris-nav-list-items"> with one <li> inside
+//                     an open shadow root) — so OLA Watch has a permanent, native-feeling place
+//                     in the nav instead of depending entirely on the conditionally-shown overlay
+//                     panel. Its badge always shows the live at-risk count, and clicking it
+//                     toggles the overlay open regardless of whether anything is currently at
+//                     risk. `sn-collapsible-list` may already be a real registered SNOW component
+//                     with its own constructor — if attachShadow rejects because one was already
+//                     attached, this falls back to a plain wrapper element rather than rendering
+//                     nothing.
 // @changelog    0.3 - Fixed the same auth-cookie bug the ACK monitor hit in its own 0.11: every
 //                     GET here was sent with no session token at all, and the one PATCH sent
 //                     `g_ck || ''` — an explicitly empty token, which ServiceNow treats as a
@@ -898,6 +922,103 @@
         panel.style.setProperty('bottom', `${Math.round(Math.max(0, window.innerHeight - rect.bottom))}px`, 'important');
     }
 
+    // ─── FAVORITES NAV ENTRY ─────────────────────────────────────────────────
+    // A persistent, native-shaped favourite — sibling to the agent's real
+    // favourites (Knowledge, Incident - Create New, etc.), appended after the
+    // last one — rather than relying solely on the overlay panel's
+    // conditional visibility. Its badge always shows the live at-risk count,
+    // and clicking it toggles the overlay open regardless of whether
+    // anything is currently at risk, so there's a permanent, discoverable
+    // entry point even on a quiet day.
+    //
+    // Structured the way the nav's other single-item favourites are: an
+    // <sn-collapsible-list> holding one <ul class="sn-polaris-nav-list-items">
+    // with a single <li>, inside an open shadow root. Real favourites get
+    // their visual styling from a shadow root the nav's own JS attaches
+    // internally, which a userscript has no way to read or reuse — so this
+    // ships its OWN <style> inside its OWN shadow root (the overlay panel's
+    // dark nav palette) rather than rendering unstyled.
+    //
+    // `sn-collapsible-list` is very likely a REAL, already-registered custom
+    // element in SNOW's own bundle — creating one with that tag name may run
+    // SNOW's constructor, which can claim the shadow root before this code
+    // gets a chance to. attachShadow throws in that case ("already hosts a
+    // shadow tree"); buildFavItem falls back to a plain wrapper rather than
+    // silently rendering nothing.
+    const FAVORITES_NAV_BODY_SELECTOR = `${FAVORITES_NAV_SELECTOR} .sn-polaris-nav-body`;
+    const FAV_ITEM_ID = 'olaWatchFavItem';
+    let favItem = null;
+    let favBadge = null;
+    let favOpenManually = false;
+
+    function buildFavItem() {
+        let item, shadow;
+        try {
+            item = document.createElement('sn-collapsible-list');
+            shadow = item.attachShadow({ mode: 'open' });
+        } catch (e) {
+            console.warn('[OLA Watch] <sn-collapsible-list> already owns a shadow root — using a plain wrapper instead', e);
+            item = document.createElement('div');
+            item.setAttribute('role', 'listitem');
+            shadow = item.attachShadow({ mode: 'open' });
+        }
+        item.id = FAV_ITEM_ID;
+        item.setAttribute('now-id', FAV_ITEM_ID);
+        item.setAttribute('component-id', FAV_ITEM_ID);
+        item.setAttribute('dir', 'ltr');
+
+        shadow.innerHTML = `
+            <style>
+                :host { display: block; }
+                ul.sn-polaris-nav-list-items { list-style: none; margin: 0; padding: 0; }
+                .olaFavRow {
+                    display: flex; align-items: center; gap: 8px;
+                    width: 100%; border: none; background: transparent; cursor: pointer;
+                    padding: 7px 12px; margin: 0; font: inherit;
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                    font-size: 13px; color: #e3ebec; text-align: left;
+                }
+                .olaFavRow:hover { background: rgba(255,255,255,0.08); }
+                .olaFavIcon { font-size: 13px; line-height: 1; flex: 0 0 auto; }
+                .olaFavLabel { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+                .olaFavBadge {
+                    flex: 0 0 auto; min-width: 16px; text-align: center;
+                    border-radius: 9px; padding: 1px 6px; font-size: 10.5px; font-weight: 700;
+                    background: #ff6b6b; color: #1a1a1a; display: none;
+                }
+                .olaFavBadge.olaShow { display: inline-block; }
+            </style>
+            <ul class="sn-polaris-nav-list-items">
+                <li>
+                    <button type="button" class="olaFavRow" title="Open OLA Watch">
+                        <span class="olaFavIcon">⏱</span>
+                        <span class="olaFavLabel">OLA Watch</span>
+                        <span class="olaFavBadge">0</span>
+                    </button>
+                </li>
+            </ul>
+        `;
+        shadow.querySelector('.olaFavRow').addEventListener('click', () => {
+            favOpenManually = !favOpenManually;
+            renderPanel();
+        });
+        favBadge = shadow.querySelector('.olaFavBadge');
+        return item;
+    }
+
+    // Re-checked every second, same as syncPanelDock and for the same reason:
+    // a Next Experience re-render on navigation would eject any child
+    // appended into the real nav, and there's no reliable event to catch
+    // that moment, so this just notices it's gone and re-appends.
+    function syncFavItem() {
+        const navBody = document.querySelector(FAVORITES_NAV_BODY_SELECTOR);
+        if (!navBody) return;
+        if (!favItem) favItem = buildFavItem();
+        if (favItem.parentElement !== navBody) {
+            navBody.appendChild(favItem); // after the last existing <sn-collapsible-list>
+        }
+    }
+
     // #olaPanel is display:none unless it carries .olaVisible, and the ONLY place
     // that normally adds that class is renderPanel's own
     // `rows.length > 0 || !!state.error` check. Several callers report a problem
@@ -946,7 +1067,9 @@
         const body = document.getElementById('olaBody');
         if (!body) return;
 
-        panel.classList.toggle('olaVisible', rows.length > 0 || !!state.error);
+        panel.classList.toggle('olaVisible', rows.length > 0 || !!state.error || favOpenManually);
+        if (favBadge) favBadge.classList.toggle('olaShow', rows.length > 0);
+        if (favBadge) favBadge.textContent = String(rows.length);
 
         body.replaceChildren();
         const myId = getMyId();
@@ -1231,6 +1354,7 @@
     buildPanel();
     renderPanel();
     syncPanelDock();
+    syncFavItem();
     setInterval(tickClocks, 1000);
     setInterval(() => { if (takesInFlight === 0) renderPanel(); }, 15000); // catch TTL/stale drift
     // On its own timer, not folded into tickClocks: the nav can appear, resize,
@@ -1239,6 +1363,7 @@
     // cheap enough (one querySelector + getBoundingClientRect) to just re-check
     // every second rather than trying to catch every event that could move it.
     setInterval(syncPanelDock, 1000);
+    setInterval(syncFavItem, 1000);
     window.addEventListener('resize', syncPanelDock);
     setInterval(pollCycle, CONFIG.POLL_TICK_MS);
     pollCycle();
@@ -1266,6 +1391,22 @@
                 panelStyle: panel ? { left: panel.style.left, width: panel.style.width, bottom: panel.style.bottom } : null
             };
             console.log('[OLA Watch] dock:', info);
+            return info;
+        },
+
+        // Answers "why isn't the favourite showing up?" — reports whether the
+        // nav body was found, whether the fav item is currently attached to
+        // it, and whether it fell back to a plain wrapper (sn-collapsible-list
+        // was already a real, shadow-owning custom element).
+        favStatus() {
+            const navBody = document.querySelector(FAVORITES_NAV_BODY_SELECTOR);
+            const info = {
+                navBodyFound: !!navBody,
+                favItemBuilt: !!favItem,
+                favItemAttached: !!(favItem && navBody && favItem.parentElement === navBody),
+                usedFallbackWrapper: !!(favItem && favItem.tagName !== 'SN-COLLAPSIBLE-LIST')
+            };
+            console.log('[OLA Watch] fav:', info);
             return info;
         },
         pollStatus() {
