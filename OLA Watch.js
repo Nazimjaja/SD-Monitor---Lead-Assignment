@@ -1,8 +1,18 @@
 // ==UserScript==
 // @name         SD Monitor - OLA Breach Warning
 // @namespace    geodis-sd-monitor
-// @version      0.1
+// @version      0.2
 // @description  Warns every SD agent when a group ticket's resolution OLA crosses 50% and 75%, and lets whoever is free take it over on the spot
+// @changelog    0.2 - Tracking INC-RES-CORP-SD (was INC_OLA_RES_SD). The OLA's clock is
+//                     FR M-F 08:00–19:00 Europe/Paris, excluding French public holidays, so
+//                     computePct now measures elapsed and total window in business
+//                     milliseconds (businessMsBetween) instead of raw wall-clock — a window
+//                     that spans a close-of-business or a weekend no longer reads as more
+//                     consumed than it actually is. CET/CEST is read from Intl at the instant
+//                     in question rather than a fixed offset, and holidays (fixed dates plus
+//                     the Easter-derived ones) are computed algorithmically so they don't need
+//                     yearly upkeep. A window with zero business hours in it — e.g. entirely on
+//                     a holiday — falls back to serverPct rather than dividing by zero.
 // @changelog    0.1 - First release. Polls task_sla for the group's running INC_OLA_RES_SD
 //                     instances, derives the clock locally from planned_end_time rather than
 //                     trusting the stored percentage, and raises one OS notification per
@@ -39,7 +49,17 @@
         // name is what narrows task_sla down to the single clock we care about.
         // If the panel reports 0 rows on a ticket you know is running, this string is
         // the first thing to check — see __olaWatchDebug.listSlaNames().
-        OLA_NAME: 'INC_OLA_RES_SD',
+        OLA_NAME: 'INC-RES-CORP-SD',
+
+        // The OLA's business schedule: (Geo) FR, Mon–Fri 08:00–19:00, Europe/Paris
+        // (CET/CEST — handled below via Intl, not a fixed UTC offset), excluding
+        // French public holidays. Drives computePct's business-time math, below.
+        SCHEDULE: {
+            TIMEZONE: 'Europe/Paris',
+            WORKDAYS: [1, 2, 3, 4, 5], // getUTCDay(): 0=Sun … 6=Sat
+            START_HOUR: 8, START_MINUTE: 0,
+            END_HOUR: 19, END_MINUTE: 0
+        },
 
         // Server-side stage filter. `in_progress` deliberately excludes:
         //   paused    — ticket parked on "awaiting user info"; the clock is stopped, so
@@ -169,6 +189,137 @@
         })).filter(row => row.slaSysId && row.taskSysId);
     }
 
+    // ─── BUSINESS SCHEDULE (FR M-F 08:00–19:00 Europe/Paris, ex. FR holidays) ─
+    // computePct needs "how much of the OLA's business window has elapsed", and
+    // that requires knowing which wall-clock hours in Paris count as business
+    // hours for any given UTC instant — including the CET/CEST flip, which a
+    // fixed offset can't represent. Intl.DateTimeFormat with timeZone carries
+    // the IANA rules (including future DST changes), so the offset is asked for
+    // rather than hard-coded.
+    function computeEasterSunday(year) {
+        // Anonymous Gregorian algorithm (Meeus/Jones/Butcher). French holidays
+        // that move with Easter (Easter Monday, Ascension, Whit Monday) are
+        // derived from this rather than hand-maintained per year.
+        const a = year % 19, b = Math.floor(year / 100), c = year % 100;
+        const d = Math.floor(b / 4), e = b % 4;
+        const f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3);
+        const h = (19 * a + b - d - g + 15) % 30;
+        const i = Math.floor(c / 4), k = c % 4;
+        const l = (32 + 2 * e + 2 * i - h - k) % 7;
+        const m = Math.floor((a + 11 * h + 22 * l) / 451);
+        const month = Math.floor((h + l - 7 * m + 114) / 31);
+        const day = ((h + l - 7 * m + 114) % 31) + 1;
+        return { year, month, day };
+    }
+
+    function ymd(year, month, day) {
+        return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }
+
+    // Pure calendar-number arithmetic (a Date built from Date.UTC and stepped in
+    // UTC days) — deliberately not a real Paris instant, so DST never perturbs
+    // "what's tomorrow's date".
+    function addCalendarDays(year, month, day, n) {
+        const d = new Date(Date.UTC(year, month - 1, day) + n * 86400000);
+        return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
+    }
+
+    const holidayCache = new Map();
+    function frenchHolidaysForYear(year) {
+        let set = holidayCache.get(year);
+        if (set) return set;
+        const easter = computeEasterSunday(year);
+        const mon  = addCalendarDays(easter.year, easter.month, easter.day, 1);  // Easter Monday
+        const asc  = addCalendarDays(easter.year, easter.month, easter.day, 39); // Ascension
+        const whit = addCalendarDays(easter.year, easter.month, easter.day, 50); // Whit Monday
+        set = new Set([
+            ymd(year, 1, 1),                        // New Year's Day
+            ymd(mon.year, mon.month, mon.day),       // Easter Monday
+            ymd(year, 5, 1),                         // Labour Day
+            ymd(year, 5, 8),                         // Victory in Europe Day
+            ymd(asc.year, asc.month, asc.day),       // Ascension
+            ymd(whit.year, whit.month, whit.day),    // Whit Monday
+            ymd(year, 7, 14),                        // Bastille Day
+            ymd(year, 8, 15),                        // Assumption
+            ymd(year, 11, 1),                        // All Saints
+            ymd(year, 11, 11),                       // Armistice Day
+            ymd(year, 12, 25)                        // Christmas
+        ]);
+        holidayCache.set(year, set);
+        return set;
+    }
+    function isFrenchHoliday(year, month, day) {
+        return frenchHolidaysForYear(year).has(ymd(year, month, day));
+    }
+
+    // Minutes to add to UTC to get Paris local time at this instant (+60 CET,
+    // +120 CEST). Read from Intl rather than guessed, so the switch date is
+    // whatever the IANA tz database says, not a hard-coded "last Sunday of March".
+    function parisOffsetMinutesAt(utcMs) {
+        const dtf = new Intl.DateTimeFormat('en-US', {
+            timeZone: CONFIG.SCHEDULE.TIMEZONE, hour12: false,
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit'
+        });
+        const map = {};
+        dtf.formatToParts(new Date(utcMs)).forEach(p => { map[p.type] = p.value; });
+        const hh = map.hour === '24' ? '00' : map.hour; // some engines format midnight as 24
+        const asUtc = Date.UTC(+map.year, +map.month - 1, +map.day, +hh, +map.minute, +map.second);
+        return (asUtc - utcMs) / 60000;
+    }
+
+    function parisDateParts(utcMs) {
+        const dtf = new Intl.DateTimeFormat('en-US', {
+            timeZone: CONFIG.SCHEDULE.TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit'
+        });
+        const map = {};
+        dtf.formatToParts(new Date(utcMs)).forEach(p => { map[p.type] = p.value; });
+        return { year: +map.year, month: +map.month, day: +map.day };
+    }
+
+    // Inverse of the above: the UTC instant for a given Paris local wall-clock
+    // time. Guesses the offset from a same-instant UTC reading, then re-checks —
+    // the only case that could disagree is the same calendar day's DST flip,
+    // which never lands inside an 08:00–19:00 window, but the re-check is cheap
+    // and removes the assumption.
+    function parisLocalToUtc(year, month, day, hour, minute) {
+        const guess = Date.UTC(year, month - 1, day, hour, minute);
+        const off1 = parisOffsetMinutesAt(guess);
+        let utcMs = guess - off1 * 60000;
+        const off2 = parisOffsetMinutesAt(utcMs);
+        if (off2 !== off1) utcMs = guess - off2 * 60000;
+        return utcMs;
+    }
+
+    function isBusinessDay(year, month, day) {
+        const dow = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+        if (!CONFIG.SCHEDULE.WORKDAYS.includes(dow)) return false;
+        return !isFrenchHoliday(year, month, day);
+    }
+
+    // Business milliseconds between two UTC instants: walks Paris calendar days
+    // between them and sums each day's overlap with the 08:00–19:00 window,
+    // skipping weekends and French holidays entirely. Capped at 400 iterations
+    // (~13 months) so a bad timestamp can't spin this forever.
+    function businessMsBetween(startMs, endMs) {
+        if (endMs <= startMs) return 0;
+        let total = 0;
+        let d = parisDateParts(startMs);
+        for (let i = 0; i < 400; i++) {
+            const dayStart = parisLocalToUtc(d.year, d.month, d.day, CONFIG.SCHEDULE.START_HOUR, CONFIG.SCHEDULE.START_MINUTE);
+            const dayEnd   = parisLocalToUtc(d.year, d.month, d.day, CONFIG.SCHEDULE.END_HOUR, CONFIG.SCHEDULE.END_MINUTE);
+            if (isBusinessDay(d.year, d.month, d.day)) {
+                const overlapStart = Math.max(startMs, dayStart);
+                const overlapEnd = Math.min(endMs, dayEnd);
+                if (overlapEnd > overlapStart) total += overlapEnd - overlapStart;
+            }
+            if (dayStart >= endMs) break;
+            d = addCalendarDays(d.year, d.month, d.day, 1);
+            if (parisLocalToUtc(d.year, d.month, d.day, 0, 0) > endMs) break;
+        }
+        return total;
+    }
+
     // ─── CLOCK MATH ──────────────────────────────────────────────────────────
     // Table API `value` timestamps are UTC, always — no CREATED_ON_IS_UTC-style
     // guessing needed here the way there is for JSONv2's sys_created_on.
@@ -190,17 +341,21 @@
     // a threshold entirely. planned_end_time is a fixed timestamp, so the live
     // number can be computed exactly.
     //
-    // ponytail: wall-clock, not schedule-aware. planned_end_time already accounts
-    // for the OLA's schedule, but elapsed time here doesn't — so a ticket that
-    // spans a non-working boundary (opened 17:50 against a schedule closing at
-    // 18:00) will read high. Harmless for a 24/7 or long-window schedule, which is
-    // the normal service-desk case. If it bites, fall back to serverPct and accept
-    // the lag, or pull business_time_left.
-    function computePct(row) {
+    // Schedule-aware: both the total window and the elapsed time are measured in
+    // business milliseconds (FR M-F 08:00–19:00 Europe/Paris, excluding French
+    // holidays) via businessMsBetween, not raw wall-clock ms. Plain wall-clock
+    // division would read a ticket opened 18:50 against a 19:00 close as already
+    // most of the way consumed, when almost none of its actual business window
+    // has passed. nowMs is a parameter (defaulting to Date.now()) purely so the
+    // self-test below can pin it rather than racing real time.
+    function computePct(row, nowMs = Date.now()) {
         const s = parseSnowUtc(row.start);
         const e = parseSnowUtc(row.plannedEnd);
         if (s == null || e == null || e <= s) return row.serverPct || null;
-        const pct = ((Date.now() - s) / (e - s)) * 100;
+        const totalBusinessMs = businessMsBetween(s, e);
+        if (totalBusinessMs <= 0) return row.serverPct || null; // window has no business hours in it — can't be schedule-derived
+        const elapsedBusinessMs = businessMsBetween(s, Math.min(nowMs, e));
+        const pct = (elapsedBusinessMs / totalBusinessMs) * 100;
         return Math.min(100, Math.max(0, pct));
     }
 
@@ -906,24 +1061,40 @@
             const check = (name, cond) => { if (!cond) fails.push(name); };
 
             const iso = ms => new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
-            const mk = (startMsAgo, totalMin) => ({
-                start: iso(Date.now() - startMsAgo),
-                plannedEnd: iso(Date.now() - startMsAgo + totalMin * 60000),
-                serverPct: 0
-            });
+            // Fixed calendar points, not "now minus N" — computePct is schedule-aware,
+            // so its answer depends on which real calendar days/hours a window falls
+            // on. Pinning start/end/now to known dates (and passing nowMs explicitly)
+            // keeps the test deterministic instead of it passing or failing depending
+            // on what day the suite happens to run.
+            const pIso = (y, m, d, hh, mi) => iso(parisLocalToUtc(y, m, d, hh, mi));
+            const pMs  = (y, m, d, hh, mi) => parisLocalToUtc(y, m, d, hh, mi);
+            const row = (startIso, endIso) => ({ start: startIso, plannedEnd: endIso, serverPct: 0 });
 
-            // 60-min OLA, 30 min elapsed → 50%
-            const half = computePct(mk(30 * 60000, 60));
-            check('50% midpoint', Math.abs(half - 50) < 1.5);
-
-            // 45 min elapsed → 75%
-            const threeQ = computePct(mk(45 * 60000, 60));
-            check('75% point', Math.abs(threeQ - 75) < 1.5);
-
+            // Tue 2026-08-04, a plain business day: 10:00–11:00 Paris is a 60
+            // business-minute OLA entirely inside the 08:00–19:00 window.
+            const sameDay = row(pIso(2026, 8, 4, 10, 0), pIso(2026, 8, 4, 11, 0));
+            check('50% midpoint', Math.abs(computePct(sameDay, pMs(2026, 8, 4, 10, 30)) - 50) < 0.5);
+            check('75% point', Math.abs(computePct(sameDay, pMs(2026, 8, 4, 10, 45)) - 75) < 0.5);
             // Past the deadline clamps to 100, never above
-            check('clamped at 100', computePct(mk(90 * 60000, 60)) === 100);
+            check('clamped at 100', computePct(sameDay, pMs(2026, 8, 4, 12, 0)) === 100);
             // Before the start clamps to 0, never negative
-            check('clamped at 0', computePct(mk(-10 * 60000, 60)) === 0);
+            check('clamped at 0', computePct(sameDay, pMs(2026, 8, 4, 9, 0)) === 0);
+
+            // Fri 2026-08-07 18:00 Paris → Mon 2026-08-10 10:00 Paris: 1 business
+            // hour left in Friday's window + 2 business hours Monday morning = 3h
+            // total. This is the case wall-clock division gets wrong — the window
+            // spans a weekend, so most of its raw duration is non-business time.
+            const spansWeekend = row(pIso(2026, 8, 7, 18, 0), pIso(2026, 8, 10, 10, 0));
+            const atFridayClose = computePct(spansWeekend, pMs(2026, 8, 7, 19, 0)); // Friday's window has just closed: 1 of 3 business hours spent
+            check('schedule-aware, not wall-clock (Friday close = 1/3)', Math.abs(atFridayClose - (100 / 3)) < 0.5);
+            const midWeekend = computePct(spansWeekend, pMs(2026, 8, 8, 12, 0)); // Saturday afternoon: no business hours have passed since Friday close
+            check('weekend adds no business time', Math.abs(midWeekend - atFridayClose) < 0.01);
+
+            // Bastille Day 2026-07-14 (Tuesday) is a French holiday: an OLA window
+            // entirely inside it has zero business hours, so computePct falls back
+            // to serverPct rather than dividing by zero.
+            const onHoliday = { start: pIso(2026, 7, 14, 8, 0), plannedEnd: pIso(2026, 7, 14, 19, 0), serverPct: 42 };
+            check('holiday window falls back to serverPct', computePct(onHoliday, pMs(2026, 7, 14, 12, 0)) === 42);
 
             // Threshold selection returns the MOST severe crossed, not the first
             check('threshold 49 → none', crossedThreshold(49) === null);
@@ -951,7 +1122,7 @@
                 console.error('[OLA Watch] selfTest FAILED:', fails);
                 return { ok: false, fails };
             }
-            console.log('[OLA Watch] selfTest passed (13 checks)');
+            console.log('[OLA Watch] selfTest passed (17 checks)');
             return { ok: true };
         }
     };
