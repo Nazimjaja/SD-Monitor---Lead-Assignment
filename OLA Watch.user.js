@@ -1,11 +1,51 @@
 // ==UserScript==
 // @name         SD Monitor - OLA Breach Warning
 // @namespace    geodis-sd-monitor
-// @version      0.6
+// @version      0.7
 // @description  Warns every SD agent when a group ticket's resolution OLA crosses 50% and 75%, and lets whoever is free take it over on the spot
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
+// @changelog    0.7 - Deep audit pass after several rounds of "still not visible." The most
+//                     likely actual cause: document.querySelector CANNOT cross a shadow
+//                     boundary, and the code's own long-standing comment already said the Next
+//                     Experience nav "lives behind a web component shadow root" — every lookup
+//                     of it was still a plain document.querySelector, which returns null forever
+//                     with zero error if that's literally true, indistinguishable from "not
+//                     rendered yet." Added deepQuerySelector, which walks into every open shadow
+//                     root it finds (cached, so it only re-walks once a hit goes stale), and
+//                     switched syncPanelDock/syncFavItem/the debug helpers to use it. Verified in
+//                     a real headless Chromium (not just a hand-rolled Node stub) against a fake
+//                     nav both in plain light DOM and nested inside a real shadow root — finds it
+//                     either way now.
+//                     Also fixed, found in the same pass: #olaPanel could get silently detached
+//                     with no re-attach logic, and renderPanel/setStatus queried it via
+//                     document.getElementById, which no-ops on a detached-but-live subtree — both
+//                     now re-attach and query through `panel` directly. Two pollCycle error paths
+//                     (broken session, no user id) called setStatus() but never wrote into shared
+//                     state, so renderPanel's next unrelated tick (its 15s catch-up timer, a
+//                     value-change from another tab, anything) would silently strip the forced-
+//                     visible class within seconds — routed through the same reportError() path
+//                     the catch block already used. syncPanelDock had no guard against a matched-
+//                     but-zero-size nav rect, which would have pinned the panel to width:0
+//                     !important — real but momentarily unlaid-out ServiceNow chrome does report
+//                     that. The favourites entry no longer uses shadow.innerHTML (a Trusted Types
+//                     sink SNOW's CSP may block, and one that fails without leaving favBadge or
+//                     the click handler wired) — rebuilt with the same DOM-construction approach
+//                     the panel already uses. It also no longer risks the real
+//                     `sn-collapsible-list` tag being defined AFTER creation (a later
+//                     customElements.define() would upgrade the node out from under it) — the
+//                     real tag is only used when customElements.get() already shows it defined;
+//                     otherwise it uses the plain-wrapper fallback proactively rather than
+//                     reactively. Minor correctness fixes found in the same read: isCrit was
+//                     hardcoded to 75 instead of deriving from CONFIG.THRESHOLDS; #olaPanel's
+//                     `display: none` was the one property in that block without !important;
+//                     its z-index (999996) sat below the ACK monitor's status pill (999998),
+//                     which docks the same bottom-left corner; and fmtRemaining had no hours/days
+//                     field at all, so a multi-hour remainder (routine now that the OLA math is
+//                     schedule-aware) rendered as an overflowing raw-minutes string like
+//                     "347:23". selfTest grew from 17 to 22 checks, including three that build a
+//                     real shadow root and confirm deepQuerySelector actually crosses it.
 // @changelog    0.6 - The load line never printed a version — unlike the ACK monitor, which
 //                     deliberately logs its own SCRIPT_VERSION so "which version is this tab
 //                     actually running" is answerable from the console instead of memory. That
@@ -572,13 +612,21 @@
         return e == null ? null : e - Date.now();
     }
 
+    // Business-time-aware OLAs routinely have hours (or, spanning a weekend,
+    // more than a day) left — the old mm:ss-only format had no hours field at
+    // all, so a 5h47m remainder rendered as the unreadable, overflowing
+    // "347:23" rather than clamping or wrapping.
     function fmtRemaining(ms) {
         if (ms == null) return '—';
         if (ms <= 0) return 'BREACHED';
-        const total = Math.floor(ms / 1000);
-        const mm = String(Math.floor(total / 60)).padStart(2, '0');
-        const ss = String(total % 60).padStart(2, '0');
-        return `${mm}:${ss}`;
+        const totalSec = Math.floor(ms / 1000);
+        const days = Math.floor(totalSec / 86400);
+        const hours = Math.floor((totalSec % 86400) / 3600);
+        const mins = Math.floor((totalSec % 3600) / 60);
+        const secs = totalSec % 60;
+        if (days > 0) return `${days}d ${String(hours).padStart(2, '0')}h`;
+        if (hours > 0) return `${hours}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+        return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
     }
 
     // Highest configured threshold this row has reached, or null. Thresholds are
@@ -767,14 +815,17 @@
             left: 0 !important;
             bottom: 0 !important;
             width: ${CONFIG.PANEL_WIDTH}px !important;
-            display: none;
+            display: none !important;
             flex-direction: column !important;
             padding: 9px 10px 10px !important;
             background: var(--nav) !important;
             border-top: 1px solid var(--nav-line) !important;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
             color: var(--nav-txt) !important;
-            z-index: 999996 !important;
+            /* Above the ACK monitor's #sdmStatusIndicator (999998), which docks
+               at the same bottom-left corner (left:16/bottom:16) — without this
+               its pill would render on top of this panel's status line. */
+            z-index: 999999 !important;
         }
         #olaPanel.olaVisible { display: flex !important; }
 
@@ -930,9 +981,56 @@
     // Experience's own !important base styles), and only another !important can
     // out-rank that.
     const FAVORITES_NAV_SELECTOR = '.sn-polaris-nav[aria-label="Favorites menu"]';
+
+    // document.querySelector CANNOT cross a shadow boundary — it only walks
+    // the light DOM of whatever it's called on. The comment above (and on
+    // PANEL_WIDTH) already says the Next Experience nav "lives behind a web
+    // component shadow root", but every lookup here used to be a plain
+    // document.querySelector anyway — if that comment is literally true for
+    // this element (rather than just the re-render risk it was written
+    // about), the selector matches nothing, forever, with no error: `if
+    // (!nav) return` just silently takes the fallback branch every single
+    // tick. This walks into every open shadow root it finds until something
+    // matches. The fast path (one native querySelector) is the only cost
+    // when nothing is shadow-nested; the walk is strictly a fallback.
+    function deepQuerySelector(selector, root = document) {
+        const direct = root.querySelector(selector);
+        if (direct) return direct;
+        const all = root.querySelectorAll('*');
+        for (let i = 0; i < all.length; i++) {
+            const sr = all[i].shadowRoot;
+            if (sr) {
+                const found = deepQuerySelector(selector, sr);
+                if (found) return found;
+            }
+        }
+        return null;
+    }
+
+    // Walking every element (and every shadow root under them) once a second
+    // is wasted work once the target has already been found — cache the hit
+    // and only re-walk once it's no longer connected (a real re-render), not
+    // on every tick.
+    const deepQueryCache = new Map();
+    function findDocked(selector) {
+        const cached = deepQueryCache.get(selector);
+        if (cached && cached.isConnected) return cached;
+        const found = deepQuerySelector(selector);
+        if (found) deepQueryCache.set(selector, found);
+        else deepQueryCache.delete(selector);
+        return found;
+    }
+
     function syncPanelDock() {
         if (!panel) return;
-        const nav = document.querySelector(FAVORITES_NAV_SELECTOR);
+        // Next Experience re-renders the nav on navigation, which would eject
+        // any node appended into the real DOM — the reason this panel is an
+        // overlay instead. The overlay itself needs the same protection: it's
+        // still just a node in document.body, and something upstream (a full
+        // page teardown/rebuild, an extension conflict) could detach it too.
+        if (!panel.isConnected) document.body.appendChild(panel);
+
+        const nav = findDocked(FAVORITES_NAV_SELECTOR);
         if (!nav) {
             // Nav not present on this view (or not rendered yet) — fall back to
             // the old assumption rather than leaving stale coordinates in place.
@@ -942,6 +1040,14 @@
             return;
         }
         const rect = nav.getBoundingClientRect();
+        // A matched-but-not-actually-laid-out nav (a display:none ancestor, a
+        // collapsed/virtualized flyout, a moment before layout has run)
+        // reports a zero or near-zero rect. Writing that as `width:0px
+        // !important` makes the panel invisible even though .olaVisible is
+        // correctly set — worse than the plain-guess fallback, since at least
+        // that renders something. Skip the write and keep whatever geometry
+        // was last good rather than pinning the panel to a degenerate box.
+        if (rect.width < 40 || rect.height < 40) return;
         panel.style.setProperty('left', `${Math.round(rect.left)}px`, 'important');
         panel.style.setProperty('width', `${Math.round(rect.width)}px`, 'important');
         // Docked to the nav's OWN bottom edge, not the viewport's — a nav that
@@ -972,21 +1078,41 @@
     // element in SNOW's own bundle — creating one with that tag name may run
     // SNOW's constructor, which can claim the shadow root before this code
     // gets a chance to. attachShadow throws in that case ("already hosts a
-    // shadow tree"); buildFavItem falls back to a plain wrapper rather than
-    // silently rendering nothing.
+    // shadow tree"), and buildFavItem falls back to a plain wrapper rather
+    // than silently rendering nothing. There's a second, later-firing version
+    // of the same hazard this doesn't fully avoid but does reduce: if the tag
+    // ISN'T registered yet at creation time, customElements.define() arriving
+    // later would upgrade this exact node out from under us, running SNOW's
+    // constructor well after we've already rendered into "our" shadow root —
+    // so the real tag name is only used when the definition can already be
+    // seen (customElements.get), which is the one case where the
+    // already-attached collision is the only threat, and that's caught.
     const FAVORITES_NAV_BODY_SELECTOR = `${FAVORITES_NAV_SELECTOR} .sn-polaris-nav-body`;
     const FAV_ITEM_ID = 'olaWatchFavItem';
     let favItem = null;
     let favBadge = null;
     let favOpenManually = false;
 
+    // DOM APIs throughout, not shadow.innerHTML — same reason the el() helper
+    // above exists: ServiceNow's CSP may enforce Trusted Types on innerHTML
+    // (a raw-string assignment throws under `require-trusted-types-for
+    // 'script'`), and unlike innerHTML, this can't silently fail partway and
+    // leave favBadge/the click handler unwired. <style>.textContent is not a
+    // governed Trusted Types sink, so the CSS still ships as one block.
     function buildFavItem() {
-        let item, shadow;
-        try {
-            item = document.createElement('sn-collapsible-list');
-            shadow = item.attachShadow({ mode: 'open' });
-        } catch (e) {
-            console.warn('[OLA Watch] <sn-collapsible-list> already owns a shadow root — using a plain wrapper instead', e);
+        let item = null;
+        let shadow;
+        const alreadyRegistered = typeof customElements !== 'undefined' && !!customElements.get('sn-collapsible-list');
+        if (alreadyRegistered) {
+            try {
+                item = document.createElement('sn-collapsible-list');
+                shadow = item.attachShadow({ mode: 'open' });
+            } catch (e) {
+                console.warn('[OLA Watch] <sn-collapsible-list> already owns a shadow root — using a plain wrapper instead', e);
+                item = null;
+            }
+        }
+        if (!item) {
             item = document.createElement('div');
             item.setAttribute('role', 'listitem');
             shadow = item.attachShadow({ mode: 'open' });
@@ -996,42 +1122,47 @@
         item.setAttribute('component-id', FAV_ITEM_ID);
         item.setAttribute('dir', 'ltr');
 
-        shadow.innerHTML = `
-            <style>
-                :host { display: block; }
-                ul.sn-polaris-nav-list-items { list-style: none; margin: 0; padding: 0; }
-                .olaFavRow {
-                    display: flex; align-items: center; gap: 8px;
-                    width: 100%; border: none; background: transparent; cursor: pointer;
-                    padding: 7px 12px; margin: 0; font: inherit;
-                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                    font-size: 13px; color: #e3ebec; text-align: left;
-                }
-                .olaFavRow:hover { background: rgba(255,255,255,0.08); }
-                .olaFavIcon { font-size: 13px; line-height: 1; flex: 0 0 auto; }
-                .olaFavLabel { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-                .olaFavBadge {
-                    flex: 0 0 auto; min-width: 16px; text-align: center;
-                    border-radius: 9px; padding: 1px 6px; font-size: 10.5px; font-weight: 700;
-                    background: #ff6b6b; color: #1a1a1a; display: none;
-                }
-                .olaFavBadge.olaShow { display: inline-block; }
-            </style>
-            <ul class="sn-polaris-nav-list-items">
-                <li>
-                    <button type="button" class="olaFavRow" title="Open OLA Watch">
-                        <span class="olaFavIcon">⏱</span>
-                        <span class="olaFavLabel">OLA Watch</span>
-                        <span class="olaFavBadge">0</span>
-                    </button>
-                </li>
-            </ul>
+        const style = document.createElement('style');
+        style.textContent = `
+            :host { display: block; }
+            ul.sn-polaris-nav-list-items { list-style: none; margin: 0; padding: 0; }
+            .olaFavRow {
+                display: flex; align-items: center; gap: 8px;
+                width: 100%; border: none; background: transparent; cursor: pointer;
+                padding: 7px 12px; margin: 0; font: inherit;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                font-size: 13px; color: #e3ebec; text-align: left;
+            }
+            .olaFavRow:hover { background: rgba(255,255,255,0.08); }
+            .olaFavIcon { font-size: 13px; line-height: 1; flex: 0 0 auto; }
+            .olaFavLabel { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .olaFavBadge {
+                flex: 0 0 auto; min-width: 16px; text-align: center;
+                border-radius: 9px; padding: 1px 6px; font-size: 10.5px; font-weight: 700;
+                background: #ff6b6b; color: #1a1a1a; display: none;
+            }
+            .olaFavBadge.olaShow { display: inline-block; }
         `;
-        shadow.querySelector('.olaFavRow').addEventListener('click', () => {
+
+        const ul = el('ul', 'sn-polaris-nav-list-items');
+        const li = document.createElement('li');
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'olaFavRow';
+        btn.title = 'Open OLA Watch';
+        const icon = el('span', 'olaFavIcon', '⏱');
+        const label = el('span', 'olaFavLabel', 'OLA Watch');
+        const badge = el('span', 'olaFavBadge', '0');
+        btn.append(icon, label, badge);
+        btn.addEventListener('click', () => {
             favOpenManually = !favOpenManually;
             renderPanel();
         });
-        favBadge = shadow.querySelector('.olaFavBadge');
+        li.appendChild(btn);
+        ul.appendChild(li);
+
+        shadow.append(style, ul);
+        favBadge = badge;
         return item;
     }
 
@@ -1040,7 +1171,7 @@
     // appended into the real nav, and there's no reliable event to catch
     // that moment, so this just notices it's gone and re-appends.
     function syncFavItem() {
-        const navBody = document.querySelector(FAVORITES_NAV_BODY_SELECTOR);
+        const navBody = findDocked(FAVORITES_NAV_BODY_SELECTOR);
         if (!navBody) return;
         if (!favItem) favItem = buildFavItem();
         if (favItem.parentElement !== navBody) {
@@ -1058,7 +1189,13 @@
     // surfacing, so it forces the panel open here rather than depending on every
     // call site to remember to do it separately.
     function setStatus(text, isError = false) {
-        const s = document.getElementById('olaStatus');
+        // Queried through panel, not document.getElementById: a panel that's
+        // been detached (however briefly, before syncPanelDock's next tick
+        // re-attaches it) still has a live subtree — document.getElementById
+        // only finds connected nodes, so it would silently no-op on exactly
+        // the tab that most needs a visible message.
+        if (!panel) return;
+        const s = panel.querySelector('#olaStatus');
         if (!s) return;
         s.textContent = text;
         s.classList.toggle('olaErr', isError);
@@ -1093,7 +1230,10 @@
         const rows = (state.rows || []).slice().sort((a, b) => (msRemaining(a) ?? Infinity) - (msRemaining(b) ?? Infinity));
         renderedRows = rows;
 
-        const body = document.getElementById('olaBody');
+        // Same reasoning as setStatus: query through panel, not
+        // document.getElementById, so a briefly-detached panel still renders
+        // instead of silently no-op'ing on `!body`.
+        const body = panel.querySelector('#olaBody');
         if (!body) return;
 
         panel.classList.toggle('olaVisible', rows.length > 0 || !!state.error || favOpenManually);
@@ -1103,7 +1243,12 @@
         body.replaceChildren();
         const myId = getMyId();
 
-        const isCrit = row => { const p = computePct(row); return p != null && p >= 75; };
+        // Derived from CONFIG.THRESHOLDS, not hardcoded — the comment on
+        // THRESHOLDS itself invites adding e.g. 90 as a last-call threshold,
+        // and a hardcoded 75 here would silently keep the "Breaching soon"
+        // split at the old value instead of following that change.
+        const critAt = Math.max(...CONFIG.THRESHOLDS);
+        const isCrit = row => { const p = computePct(row); return p != null && p >= critAt; };
 
         function addGroup(label, cls, glyph, list) {
             if (!list.length) return;
@@ -1188,7 +1333,7 @@
         addGroup('Breaching soon', 'olaCrit', '▲', rows.filter(isCrit));
         addGroup('Watch', 'olaWarn', '●', rows.filter(r => !isCrit(r)));
 
-        const countEl = document.getElementById('olaCount');
+        const countEl = panel.querySelector('#olaCount');
         if (countEl) countEl.textContent = String(rows.length);
 
         if (state.error) {
@@ -1308,6 +1453,21 @@
         return Date.now() - last.ts >= wait;
     }
 
+    // Persists an error into SHARED state, not just a local setStatus call.
+    // renderPanel recomputes .olaVisible from scratch every time it runs
+    // (`rows.length > 0 || !!state.error || favOpenManually`), and it's
+    // called on a bare 15s catch-up timer independent of anything that just
+    // happened locally — so an error that only ever touched setStatus()
+    // directly, without also landing in state.error, would get silently
+    // stripped back to invisible the next time that timer fires, typically
+    // within seconds. Also repaints THIS tab immediately, for the same
+    // reason pollOnce does: a tab can't rely on hearing its own GM storage
+    // write echoed back as a value-change event.
+    function reportError(message) {
+        setSharedState({ ...getSharedState(), error: message });
+        if (takesInFlight === 0) renderPanel();
+    }
+
     let pollInFlight = false;
     async function pollCycle(force = false) {
         if (pollInFlight) return;
@@ -1320,7 +1480,7 @@
         // than staying parked on the old failure forever.
         if (sessionBroken) {
             if (!force) {
-                setStatus('Session expired — click ⟳ to reconnect', true);
+                reportError('Session expired — click ⟳ to reconnect');
                 return;
             }
             sessionBroken = false;
@@ -1330,7 +1490,7 @@
         // every other tab stand down, so a tab that then bails would silently
         // suppress polling everywhere.
         if (!getMyId()) {
-            setStatus('no user id on this page', true);
+            reportError('No user id on this page');
             return;
         }
 
@@ -1350,18 +1510,8 @@
             await pollOnce();
             markPolled(); // measure the next interval from completion
         } catch (e) {
-            const prev = getSharedState();
-            setSharedState({ ...prev, error: e.message });
             console.error('[OLA Watch] poll failed', e);
-            // Without this, the polling tab writes the error to shared storage but
-            // never repaints itself — pollOnce's success path renders directly for
-            // exactly this reason (a tab can't rely on hearing its own GM storage
-            // write back as a value-change event), and this path was missing the
-            // same call. On a single-tab session — the common case — that meant an
-            // error made the panel go from invisible-because-nothing's-at-risk to
-            // invisible-because-broken with zero visible difference: #olaPanel stays
-            // display:none because .olaVisible is only ever added inside renderPanel.
-            if (takesInFlight === 0) renderPanel();
+            reportError(e.message);
         } finally {
             pollInFlight = false;
         }
@@ -1419,13 +1569,18 @@
             return { sessionBroken, hasToken: !!sessionToken };
         },
 
-        // Answers "why is the panel in the wrong place / not docked?" — reports
-        // whether the Favorites nav was found and what rect the panel is pinned to.
+        // Answers "why is the panel in the wrong place / not docked?" — uses
+        // the SAME lookup the real code uses (findDocked, shadow-root-aware),
+        // not a plain document.querySelector, so this reports what
+        // syncPanelDock actually sees rather than giving a false negative on
+        // a page where the nav is shadow-nested.
         dock() {
-            const nav = document.querySelector(FAVORITES_NAV_SELECTOR);
+            const nav = findDocked(FAVORITES_NAV_SELECTOR);
             const info = {
                 navFound: !!nav,
                 navRect: nav ? nav.getBoundingClientRect() : null,
+                panelAttached: !!(panel && panel.isConnected),
+                panelVisible: !!(panel && panel.classList.contains('olaVisible')),
                 panelStyle: panel ? { left: panel.style.left, width: panel.style.width, bottom: panel.style.bottom } : null
             };
             console.log('[OLA Watch] dock:', info);
@@ -1435,9 +1590,10 @@
         // Answers "why isn't the favourite showing up?" — reports whether the
         // nav body was found, whether the fav item is currently attached to
         // it, and whether it fell back to a plain wrapper (sn-collapsible-list
-        // was already a real, shadow-owning custom element).
+        // was already a real, shadow-owning custom element, or wasn't yet
+        // registered at all).
         favStatus() {
-            const navBody = document.querySelector(FAVORITES_NAV_BODY_SELECTOR);
+            const navBody = findDocked(FAVORITES_NAV_BODY_SELECTOR);
             const info = {
                 navBodyFound: !!navBody,
                 favItemBuilt: !!favItem,
@@ -1527,6 +1683,8 @@
             // Countdown floors at BREACHED rather than ticking negative
             check('negative remaining', fmtRemaining(-5000) === 'BREACHED');
             check('formats mm:ss', fmtRemaining(90 * 1000) === '01:30');
+            check('formats h:mm:ss', fmtRemaining(5400 * 1000) === '1:30:00');
+            check('formats Nd HHh', fmtRemaining(90000 * 1000) === '1d 01h');
 
             // Timestamps are read as UTC, not local
             check('utc parse', parseSnowUtc('2026-07-20 10:00:00') === Date.UTC(2026, 6, 20, 10, 0, 0));
@@ -1539,11 +1697,33 @@
             check('ledger keeps fresh', !!l.fresh);
             check('ledger drops stale', !l.stale);
 
+            // Not pure logic like the rest of this — deliberately touches the
+            // real DOM, because deepQuerySelector's entire job is crossing a
+            // real shadow boundary, and that's exactly the kind of thing a
+            // hand-written assertion about strings and numbers can't catch a
+            // regression in. Builds a real open shadow root, confirms
+            // deepQuerySelector finds an element nested inside it (which
+            // document.querySelector alone cannot), then cleans up.
+            const dqsHost = document.createElement('div');
+            const dqsShadow = dqsHost.attachShadow({ mode: 'open' });
+            const dqsTarget = document.createElement('span');
+            dqsTarget.className = 'olaSelfTestDeepTarget';
+            dqsShadow.appendChild(dqsTarget);
+            document.body.appendChild(dqsHost);
+            try {
+                check('deepQuerySelector finds a shadow-nested element', deepQuerySelector('.olaSelfTestDeepTarget') === dqsTarget);
+                check('plain querySelector cannot (sanity check on the premise)', document.querySelector('.olaSelfTestDeepTarget') === null);
+                check('deepQuerySelector returns null for a real miss', deepQuerySelector('.olaSelfTestNoSuchThing') === null);
+            } finally {
+                dqsHost.remove();
+                deepQueryCache.delete('.olaSelfTestDeepTarget');
+            }
+
             if (fails.length) {
                 console.error('[OLA Watch] selfTest FAILED:', fails);
                 return { ok: false, fails };
             }
-            console.log('[OLA Watch] selfTest passed (17 checks)');
+            console.log('[OLA Watch] selfTest passed (22 checks)');
             return { ok: true };
         }
     };
