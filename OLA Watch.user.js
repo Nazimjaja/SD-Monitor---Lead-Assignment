@@ -1,66 +1,11 @@
 // ==UserScript==
 // @name         SD Monitor - OLA Breach Warning
 // @namespace    geodis-sd-monitor
-// @version      0.4
+// @version      0.9
 // @description  Warns every SD agent when a group ticket's resolution OLA crosses 50% and 75%, and lets whoever is free take it over on the spot
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
-// @changelog    0.4 - This script had NO @updateURL/@downloadURL and was named OLA Watch.js —
-//                     without the .user.js suffix, Tampermonkey never offers an install prompt
-//                     for the raw GitHub link, and without an @updateURL it has no way to notice
-//                     new versions even if manually installed once. Every fix in 0.2/0.3 may
-//                     never have reached an already-installed copy. Renamed to OLA Watch.user.js
-//                     and added the same @updateURL/@downloadURL/@homepageURL the ACK monitor
-//                     carries (it hit this exact bug once — see its history) — but note that an
-//                     existing install still needs to be removed and reinstalled from the new
-//                     raw URL ONCE, since a script with no @updateURL has nothing to check
-//                     against and can't discover this fix on its own.
-//                     Added a persistent Favorites entry — a sibling <sn-collapsible-list>
-//                     appended into the real nav body after the existing favourites, structured
-//                     the same way (a <ul class="sn-polaris-nav-list-items"> with one <li> inside
-//                     an open shadow root) — so OLA Watch has a permanent, native-feeling place
-//                     in the nav instead of depending entirely on the conditionally-shown overlay
-//                     panel. Its badge always shows the live at-risk count, and clicking it
-//                     toggles the overlay open regardless of whether anything is currently at
-//                     risk. `sn-collapsible-list` may already be a real registered SNOW component
-//                     with its own constructor — if attachShadow rejects because one was already
-//                     attached, this falls back to a plain wrapper element rather than rendering
-//                     nothing.
-// @changelog    0.3 - Fixed the same auth-cookie bug the ACK monitor hit in its own 0.11: every
-//                     GET here was sent with no session token at all, and the one PATCH sent
-//                     `g_ck || ''` — an explicitly empty token, which ServiceNow treats as a
-//                     *failed* check and answers with 401 + WWW-Authenticate: BASIC, popping the
-//                     browser's native credential dialog every poll cycle. All requests now go
-//                     through snFetch, which reads g_ck from every place it can live, retries
-//                     once on a rejected token, recognises an SSO login page served as a 200, and
-//                     stands the tab down after a genuine failure instead of re-provoking the
-//                     dialog — the ⟳ button gives a broken session one fresh reconnect attempt.
-//                     Also fixed the panel's dock position: it was a flat guess (left:0, a fixed
-//                     248px) instead of anchored to anything real. syncPanelDock() now reads
-//                     `.sn-polaris-nav[aria-label="Favorites menu"]`'s actual
-//                     getBoundingClientRect() every second and pins left/width/bottom to match
-//                     it, so the panel sits flush against the real Favorites nav — rail or
-//                     expanded — rather than wherever left:0/248px happened to land.
-// @changelog    0.2 - Tracking INC-RES-CORP-SD (was INC_OLA_RES_SD). The OLA's clock is
-//                     FR M-F 08:00–19:00 Europe/Paris, excluding French public holidays, so
-//                     computePct now measures elapsed and total window in business
-//                     milliseconds (businessMsBetween) instead of raw wall-clock — a window
-//                     that spans a close-of-business or a weekend no longer reads as more
-//                     consumed than it actually is. CET/CEST is read from Intl at the instant
-//                     in question rather than a fixed offset, and holidays (fixed dates plus
-//                     the Easter-derived ones) are computed algorithmically so they don't need
-//                     yearly upkeep. A window with zero business hours in it — e.g. entirely on
-//                     a holiday — falls back to serverPct rather than dividing by zero.
-// @changelog    0.1 - First release. Polls task_sla for the group's running INC_OLA_RES_SD
-//                     instances, derives the clock locally from planned_end_time rather than
-//                     trusting the stored percentage, and raises one OS notification per
-//                     ticket per threshold. Polling and the fired-threshold ledger are both
-//                     shared through GM storage, so N open SNOW tabs still means one poll and
-//                     one notification. Paused and completed SLAs are filtered out server-side
-//                     so a ticket parked on "awaiting user info" stops warning. Take-over is
-//                     check-then-write against the assignee the agent actually saw, so two
-//                     agents clicking seconds apart can't both believe they got it.
 // @match        *://*.service-now.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -78,6 +23,15 @@
     // Sandboxed mode (any non-"none" @grant) isolates `window` from the real page,
     // and SNOW's globals (g_ck, g_user_id, NOW) live on the real page.
     const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+    // Read back from the installed script's own metadata, same reasoning as the
+    // ACK monitor's SCRIPT_VERSION: with the script auto-updating, "which
+    // version is this tab actually running" stops being answerable from memory,
+    // and a stale tab keeps running old code until it reloads. The load line
+    // below used to omit this entirely, which is exactly the ambiguity that
+    // made "did the reinstall actually take" impossible to answer from the
+    // console alone.
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '?';
 
     // ─── CONFIG ─────────────────────────────────────────────────────────────
     const CONFIG = {
@@ -127,22 +81,21 @@
         SOUND_ENABLED: true,
         NOTIFY_ENABLED: true,
 
-        // Docked to the bottom of the left nav, not floating. The right-hand edge is
-        // already triple-booked (ACK monitor popups stack down right:18; the
-        // assignment dashboard sits at top:70/right:18), and the nav's lower half is
-        // dead space once favourites are listed. 248px is the EXPANDED nav width —
-        // agents keep it expanded, so this is the width to design for, not the rail.
-        //
-        // It is position:fixed over the nav rather than appended into it: the Next
-        // Experience nav lives behind a web-component shadow root and re-renders on
-        // navigation, which would eject an injected node. Overlaying costs nothing
-        // and survives. syncPanelDock() reads the REAL nav container's
-        // getBoundingClientRect() every second and pins left/width/bottom to match
-        // it via .style.setProperty(..., 'important') — so the panel sits flush
-        // against wherever the Favorites nav (`.sn-polaris-nav[aria-label="Favorites
-        // menu"]`) actually is, rail or expanded, instead of assuming a fixed
-        // 248px at the viewport's left edge. PANEL_WIDTH below is only the
-        // fallback used on a page where that nav element isn't found at all.
+        // A plain fixed-position overlay, deliberately NOT anchored to any
+        // ServiceNow-internal DOM (no nav lookup, no shadow-root walking). An
+        // earlier version tried docking to the real Favorites nav's geometry
+        // and, separately, injecting a matching favourite entry into it —
+        // both were real, verified-working pieces of code (confirmed against
+        // a real Chromium instance, including real shadow-root cases), but
+        // neither could be confirmed actually finding anything on the real
+        // ServiceNow instance across several rounds, and there's no way to
+        // keep debugging blind DOM assumptions against a page this script
+        // can't see. A fixed corner has no such dependency: it either renders
+        // or it doesn't, with nothing in between to go silently wrong.
+        // top:64px clears ServiceNow's own global header bar; left:12px sits
+        // clear of the nav without needing to know anything about it.
+        PANEL_TOP: 64,
+        PANEL_LEFT: 12,
         PANEL_WIDTH: 248
     };
 
@@ -543,13 +496,21 @@
         return e == null ? null : e - Date.now();
     }
 
+    // Business-time-aware OLAs routinely have hours (or, spanning a weekend,
+    // more than a day) left — the old mm:ss-only format had no hours field at
+    // all, so a 5h47m remainder rendered as the unreadable, overflowing
+    // "347:23" rather than clamping or wrapping.
     function fmtRemaining(ms) {
         if (ms == null) return '—';
         if (ms <= 0) return 'BREACHED';
-        const total = Math.floor(ms / 1000);
-        const mm = String(Math.floor(total / 60)).padStart(2, '0');
-        const ss = String(total % 60).padStart(2, '0');
-        return `${mm}:${ss}`;
+        const totalSec = Math.floor(ms / 1000);
+        const days = Math.floor(totalSec / 86400);
+        const hours = Math.floor((totalSec % 86400) / 3600);
+        const mins = Math.floor((totalSec % 3600) / 60);
+        const secs = totalSec % 60;
+        if (days > 0) return `${days}d ${String(hours).padStart(2, '0')}h`;
+        if (hours > 0) return `${hours}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+        return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
     }
 
     // Highest configured threshold this row has reached, or null. Thresholds are
@@ -734,28 +695,44 @@
             --nav-txt: #e3ebec; --nav-dim: #a8bcbe; --nav-cap: #93a9ab;
             --crit: #ff6b6b; --warn: #f5b544;
 
+            /* Always mounted and always at least partially visible (the
+               collapsed header) — there is no display:none gate any more.
+               A plain fixed corner, not copied from any ServiceNow DOM. */
             position: fixed !important;
-            left: 0 !important;
-            bottom: 0 !important;
+            top: ${CONFIG.PANEL_TOP}px !important;
+            left: ${CONFIG.PANEL_LEFT}px !important;
             width: ${CONFIG.PANEL_WIDTH}px !important;
-            display: none;
+            display: flex !important;
             flex-direction: column !important;
-            padding: 9px 10px 10px !important;
+            padding: 0 !important;
             background: var(--nav) !important;
-            border-top: 1px solid var(--nav-line) !important;
+            border: 1px solid var(--nav-line) !important;
+            border-radius: 10px !important;
+            box-shadow: 0 6px 20px -4px rgba(0,0,0,0.45) !important;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
             color: var(--nav-txt) !important;
-            z-index: 999996 !important;
+            /* Above the ACK monitor's #sdmStatusIndicator (999998), which docks
+               the bottom-left corner — this panel no longer shares that
+               corner, but there's no reason to risk losing a future
+               stacking fight either. */
+            z-index: 999999 !important;
         }
-        #olaPanel.olaVisible { display: flex !important; }
 
         .olaHeader {
-            display: flex !important; justify-content: space-between !important; align-items: center !important;
-            padding: 0 6px 8px !important; margin: 0 !important;
+            display: flex !important; align-items: center !important; gap: 5px !important;
+            padding: 9px 10px !important; margin: 0 !important;
             font-size: 10px !important; letter-spacing: 0.08em !important; text-transform: uppercase !important;
             color: var(--nav-cap) !important;
+            cursor: pointer !important;
+            border-radius: 10px !important;
         }
-        .olaTitle { font-size: 10px !important; letter-spacing: 0.08em !important; }
+        #olaPanel.olaExpanded .olaHeader {
+            border-bottom: 1px solid var(--nav-line) !important;
+            border-radius: 10px 10px 0 0 !important;
+        }
+        .olaHeader:hover { background: var(--nav-hi) !important; }
+        .olaChevron { font-size: 9px !important; color: var(--nav-dim) !important; flex: 0 0 auto !important; }
+        .olaTitle { font-size: 10px !important; letter-spacing: 0.08em !important; flex: 1 1 auto !important; }
         .olaCount { font-weight: 700 !important; color: var(--nav-txt) !important; }
         .olaHeaderBtns { display: flex !important; gap: 4px !important; flex: 0 0 auto !important; }
         .olaIconBtn {
@@ -766,13 +743,18 @@
         }
         .olaIconBtn:hover { background: var(--nav-hi) !important; color: var(--nav-txt) !important; }
 
-        /* The nav must never scroll as a whole — favourites stay put and the list
-           scrolls inside itself. 46vh keeps the dock off the favourites on a laptop. */
+        /* Collapsed to just the header by default; .olaExpanded (toggled by
+           clicking the header, or forced on by setStatus on an error) reveals
+           the list and status line below it. */
+        .olaBody, .olaStatus { display: none !important; }
+        #olaPanel.olaExpanded .olaBody { display: block !important; }
+        #olaPanel.olaExpanded .olaStatus { display: block !important; }
+
         .olaBody {
             max-height: min(46vh, 380px) !important;
             overflow-y: auto !important;
             overscroll-behavior: contain !important;
-            padding: 0 2px 0 0 !important;
+            padding: 6px 8px 0 8px !important;
         }
         .olaBody::-webkit-scrollbar { width: 6px !important; }
         .olaBody::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2) !important; border-radius: 3px !important; }
@@ -827,7 +809,7 @@
         .olaTakeBtn:disabled { opacity: 0.5 !important; cursor: default !important; }
         .olaTakeBtn.olaMine { background: rgba(147,197,253,0.14) !important; color: #a8cbf5 !important; }
         .olaRowMsg { font-size: 10.5px !important; color: var(--crit) !important; padding: 0 6px 5px !important; }
-        .olaStatus { font-size: 10px !important; color: var(--nav-cap) !important; text-align: center !important; padding: 7px 0 0 !important; }
+        .olaStatus { font-size: 10px !important; color: var(--nav-cap) !important; text-align: center !important; padding: 7px 8px 9px !important; }
         .olaStatus.olaErr { color: var(--crit) !important; }
     `);
 
@@ -854,12 +836,25 @@
         muteBtn.title = muted ? 'Unmute alerts' : 'Mute sound + notifications for 4h (all tabs)';
     }
 
+    // Starts collapsed, expands on click (the header itself is the toggle —
+    // clicking anywhere on it except the icon buttons flips panelExpanded)
+    // or automatically when there's an error to show. Plain user control
+    // otherwise: nothing here forces it back open once the agent has seen an
+    // at-risk ticket and collapsed it, since GM_notification + the alert
+    // sound are the actual alerting mechanism — this panel is a convenience
+    // view on top of that, not the thing responsible for getting attention.
+    let panelExpanded = false;
+
     function buildPanel() {
         panel = document.createElement('div');
         panel.id = 'olaPanel';
 
         const header = el('div', 'olaHeader');
-        const title = el('span', 'olaTitle', '⏱ OLA at risk · ');
+        header.title = 'Click to expand/collapse';
+        const chevron = el('span', 'olaChevron', '▸');
+        chevron.id = 'olaChevron';
+        header.appendChild(chevron);
+        const title = el('span', 'olaTitle', '⏱ OLA Watch · ');
         const count = el('b', 'olaCount', '0');
         count.id = 'olaCount';
         title.appendChild(count);
@@ -867,15 +862,21 @@
         const btns = el('div', 'olaHeaderBtns');
 
         muteBtn = el('button', 'olaIconBtn', '🔔');
-        muteBtn.addEventListener('click', () => { toggleMute(); syncMuteBtn(); });
+        muteBtn.addEventListener('click', e => { e.stopPropagation(); toggleMute(); syncMuteBtn(); });
         syncMuteBtn();
 
         const refreshBtn = el('button', 'olaIconBtn', '⟳');
         refreshBtn.title = 'Refresh now (also reconnects if the session expired)';
-        refreshBtn.addEventListener('click', () => { forcePoll(); });
+        refreshBtn.addEventListener('click', e => { e.stopPropagation(); forcePoll(); });
 
         btns.append(muteBtn, refreshBtn);
         header.appendChild(btns);
+
+        header.addEventListener('click', e => {
+            if (e.target.closest('button')) return;
+            panelExpanded = !panelExpanded;
+            renderPanel();
+        });
 
         const body = el('div', 'olaBody');
         body.id = 'olaBody';
@@ -887,153 +888,36 @@
         document.body.appendChild(panel);
     }
 
-    // ─── DOCKING ─────────────────────────────────────────────────────────────
-    // Pins left/width/bottom to the REAL Favorites nav container's rect instead
-    // of the earlier fixed guess (left:0, PANEL_WIDTH px). aria-label is the
-    // stable selector — the class list also carries a per-session hash
-    // (`sn-polaris-nav 1b682fe1c3133010cbd77096e940dd18 can-animate`), so
-    // matching on that hash would work today and break on the next login.
-    // `.sn-polaris-nav` alone is stable too (classList membership, not the full
-    // string), but pairing it with the aria-label is the more specific match.
-    //
-    // .style.setProperty(..., 'important') rather than a plain assignment: the
-    // stylesheet rule is itself !important (needed to win against Next
-    // Experience's own !important base styles), and only another !important can
-    // out-rank that.
-    const FAVORITES_NAV_SELECTOR = '.sn-polaris-nav[aria-label="Favorites menu"]';
-    function syncPanelDock() {
-        if (!panel) return;
-        const nav = document.querySelector(FAVORITES_NAV_SELECTOR);
-        if (!nav) {
-            // Nav not present on this view (or not rendered yet) — fall back to
-            // the old assumption rather than leaving stale coordinates in place.
-            panel.style.setProperty('left', '0px', 'important');
-            panel.style.setProperty('width', `${CONFIG.PANEL_WIDTH}px`, 'important');
-            panel.style.setProperty('bottom', '0px', 'important');
-            return;
-        }
-        const rect = nav.getBoundingClientRect();
-        panel.style.setProperty('left', `${Math.round(rect.left)}px`, 'important');
-        panel.style.setProperty('width', `${Math.round(rect.width)}px`, 'important');
-        // Docked to the nav's OWN bottom edge, not the viewport's — a nav that
-        // doesn't reach the floor (a footer banner, a collapsed rail state)
-        // would otherwise leave the panel floating below where the nav actually
-        // ends.
-        panel.style.setProperty('bottom', `${Math.round(Math.max(0, window.innerHeight - rect.bottom))}px`, 'important');
+    // The only thing left to guard against, now that positioning is a plain
+    // CSS fixed corner instead of geometry copied from ServiceNow's own DOM:
+    // the node itself getting detached from something upstream (a full page
+    // teardown/rebuild, an extension conflict). Re-checked every second.
+    function ensurePanelAttached() {
+        if (panel && !panel.isConnected) document.body.appendChild(panel);
     }
 
-    // ─── FAVORITES NAV ENTRY ─────────────────────────────────────────────────
-    // A persistent, native-shaped favourite — sibling to the agent's real
-    // favourites (Knowledge, Incident - Create New, etc.), appended after the
-    // last one — rather than relying solely on the overlay panel's
-    // conditional visibility. Its badge always shows the live at-risk count,
-    // and clicking it toggles the overlay open regardless of whether
-    // anything is currently at risk, so there's a permanent, discoverable
-    // entry point even on a quiet day.
-    //
-    // Structured the way the nav's other single-item favourites are: an
-    // <sn-collapsible-list> holding one <ul class="sn-polaris-nav-list-items">
-    // with a single <li>, inside an open shadow root. Real favourites get
-    // their visual styling from a shadow root the nav's own JS attaches
-    // internally, which a userscript has no way to read or reuse — so this
-    // ships its OWN <style> inside its OWN shadow root (the overlay panel's
-    // dark nav palette) rather than rendering unstyled.
-    //
-    // `sn-collapsible-list` is very likely a REAL, already-registered custom
-    // element in SNOW's own bundle — creating one with that tag name may run
-    // SNOW's constructor, which can claim the shadow root before this code
-    // gets a chance to. attachShadow throws in that case ("already hosts a
-    // shadow tree"); buildFavItem falls back to a plain wrapper rather than
-    // silently rendering nothing.
-    const FAVORITES_NAV_BODY_SELECTOR = `${FAVORITES_NAV_SELECTOR} .sn-polaris-nav-body`;
-    const FAV_ITEM_ID = 'olaWatchFavItem';
-    let favItem = null;
-    let favBadge = null;
-    let favOpenManually = false;
 
-    function buildFavItem() {
-        let item, shadow;
-        try {
-            item = document.createElement('sn-collapsible-list');
-            shadow = item.attachShadow({ mode: 'open' });
-        } catch (e) {
-            console.warn('[OLA Watch] <sn-collapsible-list> already owns a shadow root — using a plain wrapper instead', e);
-            item = document.createElement('div');
-            item.setAttribute('role', 'listitem');
-            shadow = item.attachShadow({ mode: 'open' });
-        }
-        item.id = FAV_ITEM_ID;
-        item.setAttribute('now-id', FAV_ITEM_ID);
-        item.setAttribute('component-id', FAV_ITEM_ID);
-        item.setAttribute('dir', 'ltr');
-
-        shadow.innerHTML = `
-            <style>
-                :host { display: block; }
-                ul.sn-polaris-nav-list-items { list-style: none; margin: 0; padding: 0; }
-                .olaFavRow {
-                    display: flex; align-items: center; gap: 8px;
-                    width: 100%; border: none; background: transparent; cursor: pointer;
-                    padding: 7px 12px; margin: 0; font: inherit;
-                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                    font-size: 13px; color: #e3ebec; text-align: left;
-                }
-                .olaFavRow:hover { background: rgba(255,255,255,0.08); }
-                .olaFavIcon { font-size: 13px; line-height: 1; flex: 0 0 auto; }
-                .olaFavLabel { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-                .olaFavBadge {
-                    flex: 0 0 auto; min-width: 16px; text-align: center;
-                    border-radius: 9px; padding: 1px 6px; font-size: 10.5px; font-weight: 700;
-                    background: #ff6b6b; color: #1a1a1a; display: none;
-                }
-                .olaFavBadge.olaShow { display: inline-block; }
-            </style>
-            <ul class="sn-polaris-nav-list-items">
-                <li>
-                    <button type="button" class="olaFavRow" title="Open OLA Watch">
-                        <span class="olaFavIcon">⏱</span>
-                        <span class="olaFavLabel">OLA Watch</span>
-                        <span class="olaFavBadge">0</span>
-                    </button>
-                </li>
-            </ul>
-        `;
-        shadow.querySelector('.olaFavRow').addEventListener('click', () => {
-            favOpenManually = !favOpenManually;
-            renderPanel();
-        });
-        favBadge = shadow.querySelector('.olaFavBadge');
-        return item;
-    }
-
-    // Re-checked every second, same as syncPanelDock and for the same reason:
-    // a Next Experience re-render on navigation would eject any child
-    // appended into the real nav, and there's no reliable event to catch
-    // that moment, so this just notices it's gone and re-appends.
-    function syncFavItem() {
-        const navBody = document.querySelector(FAVORITES_NAV_BODY_SELECTOR);
-        if (!navBody) return;
-        if (!favItem) favItem = buildFavItem();
-        if (favItem.parentElement !== navBody) {
-            navBody.appendChild(favItem); // after the last existing <sn-collapsible-list>
-        }
-    }
-
-    // #olaPanel is display:none unless it carries .olaVisible, and the ONLY place
-    // that normally adds that class is renderPanel's own
-    // `rows.length > 0 || !!state.error` check. Several callers report a problem
-    // straight to this status line WITHOUT going through renderPanel first — no
-    // user id on the page, a broken session, the very first poll before any
-    // shared state exists — and those calls used to write into a panel that was
-    // still display:none, so the message went nowhere. An error is always worth
-    // surfacing, so it forces the panel open here rather than depending on every
-    // call site to remember to do it separately.
+    // The panel itself is always mounted and visible now (no more
+    // display:none gate) — collapsed to just its header by default, expanded
+    // by a user click. An error is worth overriding that: it forces
+    // panelExpanded open here rather than depending on every call site to
+    // remember to do it, so a genuine problem is never sitting collapsed and
+    // unseen behind a manual toggle the agent hasn't touched yet.
     function setStatus(text, isError = false) {
-        const s = document.getElementById('olaStatus');
+        // Queried through panel, not document.getElementById: a panel that's
+        // been detached (however briefly, before the next ensurePanelAttached
+        // tick re-attaches it) still has a live subtree — document.getElementById
+        // only finds connected nodes, so it would silently no-op on exactly
+        // the tab that most needs a visible message.
+        if (!panel) return;
+        const s = panel.querySelector('#olaStatus');
         if (!s) return;
         s.textContent = text;
         s.classList.toggle('olaErr', isError);
-        if (isError && panel) panel.classList.add('olaVisible');
+        if (isError) {
+            panelExpanded = true;
+            panel.classList.add('olaExpanded');
+        }
     }
 
     // Rows currently rendered, so the 1s ticker can update clocks without a re-render
@@ -1064,17 +948,25 @@
         const rows = (state.rows || []).slice().sort((a, b) => (msRemaining(a) ?? Infinity) - (msRemaining(b) ?? Infinity));
         renderedRows = rows;
 
-        const body = document.getElementById('olaBody');
+        // Same reasoning as setStatus: query through panel, not
+        // document.getElementById, so a briefly-detached panel still renders
+        // instead of silently no-op'ing on `!body`.
+        const body = panel.querySelector('#olaBody');
         if (!body) return;
 
-        panel.classList.toggle('olaVisible', rows.length > 0 || !!state.error || favOpenManually);
-        if (favBadge) favBadge.classList.toggle('olaShow', rows.length > 0);
-        if (favBadge) favBadge.textContent = String(rows.length);
+        panel.classList.toggle('olaExpanded', panelExpanded);
+        const chevron = panel.querySelector('#olaChevron');
+        if (chevron) chevron.textContent = panelExpanded ? '▾' : '▸';
 
         body.replaceChildren();
         const myId = getMyId();
 
-        const isCrit = row => { const p = computePct(row); return p != null && p >= 75; };
+        // Derived from CONFIG.THRESHOLDS, not hardcoded — the comment on
+        // THRESHOLDS itself invites adding e.g. 90 as a last-call threshold,
+        // and a hardcoded 75 here would silently keep the "Breaching soon"
+        // split at the old value instead of following that change.
+        const critAt = Math.max(...CONFIG.THRESHOLDS);
+        const isCrit = row => { const p = computePct(row); return p != null && p >= critAt; };
 
         function addGroup(label, cls, glyph, list) {
             if (!list.length) return;
@@ -1159,7 +1051,7 @@
         addGroup('Breaching soon', 'olaCrit', '▲', rows.filter(isCrit));
         addGroup('Watch', 'olaWarn', '●', rows.filter(r => !isCrit(r)));
 
-        const countEl = document.getElementById('olaCount');
+        const countEl = panel.querySelector('#olaCount');
         if (countEl) countEl.textContent = String(rows.length);
 
         if (state.error) {
@@ -1279,6 +1171,23 @@
         return Date.now() - last.ts >= wait;
     }
 
+    // Persists an error into SHARED state, not just a local setStatus call.
+    // renderPanel rewrites the status line's TEXT from state.error on every
+    // run (`if (state.error) setStatus('Error: ' + state.error) else
+    // setStatus('updated ...')`), and it's called on a bare 15s catch-up
+    // timer independent of anything that just happened locally — so an
+    // error that only ever touched setStatus() directly, without also
+    // landing in state.error, would have its message overwritten back to
+    // "updated —" the next time that timer fires, even though panelExpanded
+    // itself would stay true (nothing else resets it). Also repaints THIS
+    // tab immediately, for the same reason pollOnce does: a tab can't rely
+    // on hearing its own GM storage write echoed back as a value-change
+    // event.
+    function reportError(message) {
+        setSharedState({ ...getSharedState(), error: message });
+        if (takesInFlight === 0) renderPanel();
+    }
+
     let pollInFlight = false;
     async function pollCycle(force = false) {
         if (pollInFlight) return;
@@ -1291,7 +1200,7 @@
         // than staying parked on the old failure forever.
         if (sessionBroken) {
             if (!force) {
-                setStatus('Session expired — click ⟳ to reconnect', true);
+                reportError('Session expired — click ⟳ to reconnect');
                 return;
             }
             sessionBroken = false;
@@ -1301,7 +1210,7 @@
         // every other tab stand down, so a tab that then bails would silently
         // suppress polling everywhere.
         if (!getMyId()) {
-            setStatus('no user id on this page', true);
+            reportError('No user id on this page');
             return;
         }
 
@@ -1321,18 +1230,8 @@
             await pollOnce();
             markPolled(); // measure the next interval from completion
         } catch (e) {
-            const prev = getSharedState();
-            setSharedState({ ...prev, error: e.message });
             console.error('[OLA Watch] poll failed', e);
-            // Without this, the polling tab writes the error to shared storage but
-            // never repaints itself — pollOnce's success path renders directly for
-            // exactly this reason (a tab can't rely on hearing its own GM storage
-            // write back as a value-change event), and this path was missing the
-            // same call. On a single-tab session — the common case — that meant an
-            // error made the panel go from invisible-because-nothing's-at-risk to
-            // invisible-because-broken with zero visible difference: #olaPanel stays
-            // display:none because .olaVisible is only ever added inside renderPanel.
-            if (takesInFlight === 0) renderPanel();
+            reportError(e.message);
         } finally {
             pollInFlight = false;
         }
@@ -1353,25 +1252,25 @@
     // ─── INIT ────────────────────────────────────────────────────────────────
     buildPanel();
     renderPanel();
-    syncPanelDock();
-    syncFavItem();
     setInterval(tickClocks, 1000);
     setInterval(() => { if (takesInFlight === 0) renderPanel(); }, 15000); // catch TTL/stale drift
-    // On its own timer, not folded into tickClocks: the nav can appear, resize,
-    // collapse to a rail, or get ejected-and-rebuilt by a Next Experience
-    // re-render at any point independent of the clock/poll cadence, and this is
-    // cheap enough (one querySelector + getBoundingClientRect) to just re-check
-    // every second rather than trying to catch every event that could move it.
-    setInterval(syncPanelDock, 1000);
-    setInterval(syncFavItem, 1000);
-    window.addEventListener('resize', syncPanelDock);
+    setInterval(ensurePanelAttached, 1000);
     setInterval(pollCycle, CONFIG.POLL_TICK_MS);
     pollCycle();
 
     document.addEventListener('visibilitychange', () => { if (isVisible()) pollCycle(); });
 
     // ─── DEBUG / SELF-CHECK (console) ────────────────────────────────────────
-    window.__olaWatchDebug = {
+    // Assigned to pageWindow (== unsafeWindow), not the bare `window` above it.
+    // A non-"none" @grant runs this script in Tampermonkey's isolated sandbox,
+    // where `window` is a DIFFERENT object from the real page's — the exact
+    // reason pageWindow exists at all (to reach g_ck/g_user_id on the real
+    // page). window.__olaWatchDebug = {...} was reachable from code running
+    // IN the sandbox, but invisible to anything typed directly into DevTools,
+    // which always evaluates against the real page's window. Also kept on
+    // `window` for a hypothetical @grant none run, where they're the same object.
+    const debugApi = {
+        version: SCRIPT_VERSION,
         forcePoll,
         state: () => getSharedState(),
         ledger: () => getLedger(),
@@ -1381,32 +1280,20 @@
             return { sessionBroken, hasToken: !!sessionToken };
         },
 
-        // Answers "why is the panel in the wrong place / not docked?" — reports
-        // whether the Favorites nav was found and what rect the panel is pinned to.
-        dock() {
-            const nav = document.querySelector(FAVORITES_NAV_SELECTOR);
+        // Answers "why can't I see the panel?" now that it's a plain fixed
+        // corner with no ServiceNow DOM dependency — if attached+visible
+        // both come back true here and it's STILL not visible on screen,
+        // that points at something else entirely (another element painted
+        // on top at a higher z-index, a page-level CSS transform, etc.)
+        // rather than anything this script's own logic could be getting
+        // wrong about finding a target element.
+        panelStatus() {
             const info = {
-                navFound: !!nav,
-                navRect: nav ? nav.getBoundingClientRect() : null,
-                panelStyle: panel ? { left: panel.style.left, width: panel.style.width, bottom: panel.style.bottom } : null
+                attached: !!(panel && panel.isConnected),
+                expanded: panelExpanded,
+                rect: panel ? panel.getBoundingClientRect() : null
             };
-            console.log('[OLA Watch] dock:', info);
-            return info;
-        },
-
-        // Answers "why isn't the favourite showing up?" — reports whether the
-        // nav body was found, whether the fav item is currently attached to
-        // it, and whether it fell back to a plain wrapper (sn-collapsible-list
-        // was already a real, shadow-owning custom element).
-        favStatus() {
-            const navBody = document.querySelector(FAVORITES_NAV_BODY_SELECTOR);
-            const info = {
-                navBodyFound: !!navBody,
-                favItemBuilt: !!favItem,
-                favItemAttached: !!(favItem && navBody && favItem.parentElement === navBody),
-                usedFallbackWrapper: !!(favItem && favItem.tagName !== 'SN-COLLAPSIBLE-LIST')
-            };
-            console.log('[OLA Watch] fav:', info);
+            console.log('[OLA Watch] panel:', info);
             return info;
         },
         pollStatus() {
@@ -1489,6 +1376,8 @@
             // Countdown floors at BREACHED rather than ticking negative
             check('negative remaining', fmtRemaining(-5000) === 'BREACHED');
             check('formats mm:ss', fmtRemaining(90 * 1000) === '01:30');
+            check('formats h:mm:ss', fmtRemaining(5400 * 1000) === '1:30:00');
+            check('formats Nd HHh', fmtRemaining(90000 * 1000) === '1d 01h');
 
             // Timestamps are read as UTC, not local
             check('utc parse', parseSnowUtc('2026-07-20 10:00:00') === Date.UTC(2026, 6, 20, 10, 0, 0));
@@ -1505,10 +1394,12 @@
                 console.error('[OLA Watch] selfTest FAILED:', fails);
                 return { ok: false, fails };
             }
-            console.log('[OLA Watch] selfTest passed (17 checks)');
+            console.log('[OLA Watch] selfTest passed (19 checks)');
             return { ok: true };
         }
     };
+    pageWindow.__olaWatchDebug = debugApi;
+    window.__olaWatchDebug = debugApi;
 
-    console.log(`[OLA Watch] loaded — group ${CONFIG.ASSIGNMENT_GROUP}, OLA ${CONFIG.OLA_NAME}, thresholds ${CONFIG.THRESHOLDS.join('/')}%`);
+    console.log(`[OLA Watch] v${SCRIPT_VERSION} loaded on ${location.hostname} — group ${CONFIG.ASSIGNMENT_GROUP}, OLA ${CONFIG.OLA_NAME}, thresholds ${CONFIG.THRESHOLDS.join('/')}%`);
 })();
