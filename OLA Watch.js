@@ -1,8 +1,23 @@
 // ==UserScript==
 // @name         SD Monitor - OLA Breach Warning
 // @namespace    geodis-sd-monitor
-// @version      0.2
+// @version      0.3
 // @description  Warns every SD agent when a group ticket's resolution OLA crosses 50% and 75%, and lets whoever is free take it over on the spot
+// @changelog    0.3 - Fixed the same auth-cookie bug the ACK monitor hit in its own 0.11: every
+//                     GET here was sent with no session token at all, and the one PATCH sent
+//                     `g_ck || ''` — an explicitly empty token, which ServiceNow treats as a
+//                     *failed* check and answers with 401 + WWW-Authenticate: BASIC, popping the
+//                     browser's native credential dialog every poll cycle. All requests now go
+//                     through snFetch, which reads g_ck from every place it can live, retries
+//                     once on a rejected token, recognises an SSO login page served as a 200, and
+//                     stands the tab down after a genuine failure instead of re-provoking the
+//                     dialog — the ⟳ button gives a broken session one fresh reconnect attempt.
+//                     Also fixed the panel's dock position: it was a flat guess (left:0, a fixed
+//                     248px) instead of anchored to anything real. syncPanelDock() now reads
+//                     `.sn-polaris-nav[aria-label="Favorites menu"]`'s actual
+//                     getBoundingClientRect() every second and pins left/width/bottom to match
+//                     it, so the panel sits flush against the real Favorites nav — rail or
+//                     expanded — rather than wherever left:0/248px happened to land.
 // @changelog    0.2 - Tracking INC-RES-CORP-SD (was INC_OLA_RES_SD). The OLA's clock is
 //                     FR M-F 08:00–19:00 Europe/Paris, excluding French public holidays, so
 //                     computePct now measures elapsed and total window in business
@@ -97,19 +112,159 @@
         // It is position:fixed over the nav rather than appended into it: the Next
         // Experience nav lives behind a web-component shadow root and re-renders on
         // navigation, which would eject an injected node. Overlaying costs nothing
-        // and survives.
+        // and survives. syncPanelDock() reads the REAL nav container's
+        // getBoundingClientRect() every second and pins left/width/bottom to match
+        // it via .style.setProperty(..., 'important') — so the panel sits flush
+        // against wherever the Favorites nav (`.sn-polaris-nav[aria-label="Favorites
+        // menu"]`) actually is, rail or expanded, instead of assuming a fixed
+        // 248px at the viewport's left edge. PANEL_WIDTH below is only the
+        // fallback used on a page where that nav element isn't found at all.
         PANEL_WIDTH: 248
     };
 
     const TAB_ID = Date.now() + '-' + Math.random().toString(36).slice(2);
 
+    // ─── SESSION / AUTHENTICATION ────────────────────────────────────────────
+    // Every request rides the browser's existing SSO session cookies — never a
+    // credential prompt. But a cookie alone is NOT enough: ServiceNow rejects a
+    // session-authenticated API call that arrives without the session token
+    // (g_ck) in X-UserToken, and answers that rejection with "401 + WWW-
+    // Authenticate: BASIC" — the exact header that makes the browser throw up
+    // its native username/password dialog, which no SSO login can ever satisfy.
+    // The earlier version of this script sent no token at all on its GET
+    // requests (`fetch(url)`, nothing more) and `g_ck || ''` — an explicitly
+    // empty token, which SNOW treats as a *failed* check, worse than none — on
+    // its one PATCH. A poll on a 30s timer that keeps doing that re-provokes
+    // the dialog every cycle forever. This mirrors the fix the ACK monitor
+    // needed for the same bug (its 0.11): every request goes through snFetch,
+    // which always attaches a real token and stands the tab down on the first
+    // genuine auth failure instead of retrying into another prompt.
+    class SessionError extends Error {
+        constructor(message) { super(message); this.name = 'SessionError'; }
+    }
+
+    let sessionToken = null;
+    let sessionTokenPromise = null;
+    let sessionBroken = false;
+
+    // Where g_ck lives depends on which UI you're on: a global in UI16, hung off
+    // the NOW namespace in Next Experience, and in a hidden form field on plain
+    // .do pages. Checking all of them is what keeps this from silently degrading
+    // to an empty (worse-than-none) token.
+    function tokenFromPageWindow() {
+        const w = pageWindow;
+        const field = document.querySelector('input[name="sysparm_ck"]');
+        const candidates = [
+            w.g_ck,
+            w.NOW && w.NOW.g_ck,
+            w.NOW && w.NOW.session && w.NOW.session.token,
+            w.g_sysparm_ck,
+            field && field.value
+        ];
+        return candidates.find(v => typeof v === 'string' && v.length >= 32) || null;
+    }
+
+    // Fallback for UIs that expose g_ck nowhere reachable: scrape it out of a
+    // page fetched with the session cookies. A bare fetch, deliberately — it
+    // must not route through snFetch, which would need a token to run and recurse.
+    async function tokenFromBlankPage() {
+        const r = await fetch('/blank.do', { credentials: 'same-origin', cache: 'no-store' });
+        if (!r.ok) return null;
+        const text = await r.text();
+        const m = /(?:var\s+g_ck\s*=|["']g_ck["']\s*:)\s*["']([^"']{32,})["']/.exec(text);
+        return m ? m[1] : null;
+    }
+
+    async function getSessionToken(forceRefresh = false) {
+        if (sessionToken && !forceRefresh) return sessionToken;
+        const direct = tokenFromPageWindow();
+        if (direct) { sessionToken = direct; return sessionToken; }
+        if (!sessionTokenPromise) {
+            sessionTokenPromise = tokenFromBlankPage()
+                .catch(() => null)
+                .then(t => { sessionToken = t; return t; })
+                .finally(() => { sessionTokenPromise = null; });
+        }
+        return sessionTokenPromise;
+    }
+
+    // A dead SSO session usually arrives as a redirect to the IdP rather than a
+    // 401 — i.e. a 200 full of HTML. Without this it reaches r.json() and
+    // surfaces as an unexplained "Unexpected token <" instead of "sign in again".
+    function looksLikeLoginPage(text) {
+        return /<form[^>]+login\.do/i.test(text)
+            || /name=["']sysparm_login/i.test(text)
+            || /SAMLRequest/i.test(text)
+            || /<title>[^<]*(sign in|log ?in)/i.test(text);
+    }
+
+    function markSessionBroken(reason) {
+        if (sessionBroken) return;
+        sessionBroken = true;
+        sessionToken = null;
+        setStatus(`Session expired (${reason}) — click ⟳ to reconnect`, true);
+        console.warn('[OLA Watch] session broken:', reason);
+    }
+
+    // Single funnel for every ServiceNow call, so the cookie/token/redirect
+    // handling can't drift apart between the read and write paths the way it did
+    // before (GETs sending nothing, the one PATCH sending an empty token).
+    async function snFetch(path, { method = 'GET', body = null, headers = {} } = {}) {
+        if (sessionBroken) {
+            throw new SessionError('Paused — the ServiceNow session needs re-authenticating.');
+        }
+
+        const send = token => {
+            const h = Object.assign({
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                // Ask SNOW to answer an expired session with a 401 body instead of
+                // 302-ing into the SSO login flow — following that redirect is both
+                // how HTML ends up parsed as JSON and an extra chance for the
+                // browser's own auth challenge to fire.
+                'X-No-Response-Redirect': 'true'
+            }, headers);
+            if (token) h['X-UserToken'] = token; // never an empty token — see class comment above
+            return fetch(path, {
+                method, headers: h, body,
+                credentials: 'same-origin', // the SSO cookies are the whole auth story
+                cache: 'no-store',
+                redirect: 'follow'
+            });
+        };
+
+        const token = await getSessionToken();
+        let r = await send(token);
+
+        // A rejected token is recoverable — the page may have been open across a
+        // session renewal — so re-read g_ck and retry exactly once. A second
+        // failure means the session itself is gone.
+        if (r.status === 401 || r.status === 403) {
+            const fresh = await getSessionToken(true);
+            if (fresh && fresh !== token) r = await send(fresh);
+        }
+        if (r.status === 401 || r.status === 403 || r.headers.get('X-Is-Logged-In') === 'false') {
+            markSessionBroken(`HTTP ${r.status}`);
+            throw new SessionError('Not signed in to ServiceNow, or the session token is no longer valid.');
+        }
+
+        if (r.ok && !/json/i.test(r.headers.get('content-type') || '')) {
+            const text = await r.text();
+            if (looksLikeLoginPage(text)) {
+                markSessionBroken('SSO returned its sign-in page');
+                throw new SessionError('The ServiceNow session has expired — SSO returned its login page.');
+            }
+            throw new Error(`Expected JSON from ${path}, got ${r.headers.get('content-type') || 'no content-type'}.`);
+        }
+        return r;
+    }
+
     // ─── SNOW HELPERS ────────────────────────────────────────────────────────
-    function getCsrfToken() { return pageWindow.g_ck || ''; }
     function getMyId()      { return pageWindow.NOW?.user?.userID || pageWindow.g_user_id || ''; }
     function getMyName()    { return pageWindow.NOW?.user?.fullName || pageWindow.g_user_name || 'You'; }
 
     async function jFetch(table, query, limit = 20) {
-        const r = await fetch(`/${table}_list.do?JSONv2&sysparm_action=getRecords&sysparm_query=${query}&sysparm_limit=${limit}`);
+        const r = await snFetch(`/${table}_list.do?JSONv2&sysparm_action=getRecords&sysparm_query=${query}&sysparm_limit=${limit}`);
         if (!r.ok) throw new Error(`${table}: HTTP ${r.status}`);
         return (await r.json()).records || [];
     }
@@ -168,7 +323,7 @@
             + `&sysparm_display_value=all`
             + `&sysparm_limit=${CONFIG.ROW_LIMIT}`;
 
-        const r = await fetch(url, { headers: { Accept: 'application/json' } });
+        const r = await snFetch(url);
         if (!r.ok) throw new Error(`task_sla: HTTP ${r.status} — ${(await r.text()).slice(0, 120)}`);
         const records = (await r.json())?.result || [];
 
@@ -482,9 +637,8 @@
 
     // ─── TAKE-OVER (check-then-write) ────────────────────────────────────────
     async function readAssignee(table, sysId) {
-        const r = await fetch(
-            `/api/now/table/${table}/${encodeURIComponent(sysId)}?sysparm_fields=assigned_to&sysparm_display_value=all`,
-            { headers: { Accept: 'application/json' } }
+        const r = await snFetch(
+            `/api/now/table/${table}/${encodeURIComponent(sysId)}?sysparm_fields=assigned_to&sysparm_display_value=all`
         );
         if (!r.ok) throw new Error(`read-back failed: HTTP ${r.status}`);
         const f = (await r.json())?.result?.assigned_to;
@@ -497,13 +651,9 @@
     // API answers 200 and silently discards a field you lack write access to, so a
     // successful-looking response does not mean the ticket moved.
     async function assignRecord(table, sysId, userId) {
-        const r = await fetch(`/api/now/table/${table}/${encodeURIComponent(sysId)}`, {
+        const r = await snFetch(`/api/now/table/${table}/${encodeURIComponent(sysId)}`, {
             method: 'PATCH',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'X-UserToken': getCsrfToken()
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ assigned_to: userId })
         });
         if (!r.ok) throw new Error(`HTTP ${r.status} — ${(await r.text()).slice(0, 120)}`);
@@ -697,7 +847,7 @@
         syncMuteBtn();
 
         const refreshBtn = el('button', 'olaIconBtn', '⟳');
-        refreshBtn.title = 'Refresh now';
+        refreshBtn.title = 'Refresh now (also reconnects if the session expired)';
         refreshBtn.addEventListener('click', () => { forcePoll(); });
 
         btns.append(muteBtn, refreshBtn);
@@ -711,6 +861,41 @@
 
         panel.append(header, body, status);
         document.body.appendChild(panel);
+    }
+
+    // ─── DOCKING ─────────────────────────────────────────────────────────────
+    // Pins left/width/bottom to the REAL Favorites nav container's rect instead
+    // of the earlier fixed guess (left:0, PANEL_WIDTH px). aria-label is the
+    // stable selector — the class list also carries a per-session hash
+    // (`sn-polaris-nav 1b682fe1c3133010cbd77096e940dd18 can-animate`), so
+    // matching on that hash would work today and break on the next login.
+    // `.sn-polaris-nav` alone is stable too (classList membership, not the full
+    // string), but pairing it with the aria-label is the more specific match.
+    //
+    // .style.setProperty(..., 'important') rather than a plain assignment: the
+    // stylesheet rule is itself !important (needed to win against Next
+    // Experience's own !important base styles), and only another !important can
+    // out-rank that.
+    const FAVORITES_NAV_SELECTOR = '.sn-polaris-nav[aria-label="Favorites menu"]';
+    function syncPanelDock() {
+        if (!panel) return;
+        const nav = document.querySelector(FAVORITES_NAV_SELECTOR);
+        if (!nav) {
+            // Nav not present on this view (or not rendered yet) — fall back to
+            // the old assumption rather than leaving stale coordinates in place.
+            panel.style.setProperty('left', '0px', 'important');
+            panel.style.setProperty('width', `${CONFIG.PANEL_WIDTH}px`, 'important');
+            panel.style.setProperty('bottom', '0px', 'important');
+            return;
+        }
+        const rect = nav.getBoundingClientRect();
+        panel.style.setProperty('left', `${Math.round(rect.left)}px`, 'important');
+        panel.style.setProperty('width', `${Math.round(rect.width)}px`, 'important');
+        // Docked to the nav's OWN bottom edge, not the viewport's — a nav that
+        // doesn't reach the floor (a footer banner, a collapsed rail state)
+        // would otherwise leave the panel floating below where the nav actually
+        // ends.
+        panel.style.setProperty('bottom', `${Math.round(Math.max(0, window.innerHeight - rect.bottom))}px`, 'important');
     }
 
     function setStatus(text, isError = false) {
@@ -966,6 +1151,19 @@
         if (pollInFlight) return;
         if (!force && !pollIsDue()) return;
 
+        // A tab with a broken session must not stake the poll claim — claiming it
+        // makes every other tab stand down, and the fetch would just fail here too.
+        // Declining lets a healthy tab take the round. An explicit force (the ⟳
+        // button, i.e. "I signed back in, try again") gets one fresh attempt rather
+        // than staying parked on the old failure forever.
+        if (sessionBroken) {
+            if (!force) {
+                setStatus('Session expired — click ⟳ to reconnect', true);
+                return;
+            }
+            sessionBroken = false;
+        }
+
         // Never volunteer if this tab can't do the work. Staking the claim makes
         // every other tab stand down, so a tab that then bails would silently
         // suppress polling everywhere.
@@ -1013,8 +1211,16 @@
     // ─── INIT ────────────────────────────────────────────────────────────────
     buildPanel();
     renderPanel();
+    syncPanelDock();
     setInterval(tickClocks, 1000);
     setInterval(() => { if (takesInFlight === 0) renderPanel(); }, 15000); // catch TTL/stale drift
+    // On its own timer, not folded into tickClocks: the nav can appear, resize,
+    // collapse to a rail, or get ejected-and-rebuilt by a Next Experience
+    // re-render at any point independent of the clock/poll cadence, and this is
+    // cheap enough (one querySelector + getBoundingClientRect) to just re-check
+    // every second rather than trying to catch every event that could move it.
+    setInterval(syncPanelDock, 1000);
+    window.addEventListener('resize', syncPanelDock);
     setInterval(pollCycle, CONFIG.POLL_TICK_MS);
     pollCycle();
 
@@ -1026,6 +1232,23 @@
         state: () => getSharedState(),
         ledger: () => getLedger(),
         clearLedger() { GM_deleteValue(LEDGER_KEY); console.log('[OLA Watch] ledger cleared'); },
+        sessionStatus() {
+            console.log('[OLA Watch] sessionBroken:', sessionBroken, '| have token:', !!sessionToken);
+            return { sessionBroken, hasToken: !!sessionToken };
+        },
+
+        // Answers "why is the panel in the wrong place / not docked?" — reports
+        // whether the Favorites nav was found and what rect the panel is pinned to.
+        dock() {
+            const nav = document.querySelector(FAVORITES_NAV_SELECTOR);
+            const info = {
+                navFound: !!nav,
+                navRect: nav ? nav.getBoundingClientRect() : null,
+                panelStyle: panel ? { left: panel.style.left, width: panel.style.width, bottom: panel.style.bottom } : null
+            };
+            console.log('[OLA Watch] dock:', info);
+            return info;
+        },
         pollStatus() {
             const last = readLastPoll();
             console.log('[OLA Watch] last poll:', last,
@@ -1042,7 +1265,7 @@
             const gid = await resolveGroupSysId();
             const url = `/api/now/table/task_sla?sysparm_query=${encodeURIComponent(`active=true^task.assignment_group=${gid}`)}`
                 + `&sysparm_fields=${encodeURIComponent('sla.name,stage,task.number')}&sysparm_display_value=all&sysparm_limit=50`;
-            const r = await fetch(url, { headers: { Accept: 'application/json' } });
+            const r = await snFetch(url);
             const rows = (await r.json())?.result || [];
             const names = {};
             rows.forEach(x => {
