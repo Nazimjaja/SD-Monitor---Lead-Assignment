@@ -1,11 +1,21 @@
 // ==UserScript==
 // @name         SD Monitor - Live Acknowledge Popup
 // @namespace    geodis-sd-monitor
-// @version      0.19
+// @version      0.20
 // @description  Cross-site synced live alert for unacknowledged tickets; full function on ServiceNow, mirrored popups elsewhere
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
 // @downloadURL  https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20ACK.user.js
+// @changelog    0.20 - An incident whose Impact reads "Not Set" is acknowledged again. 0.12
+//                     narrowed the mandatory-field step to fill Impact only when nobody had
+//                     set one, and read "nobody has set one" as the empty "-- None --"
+//                     option. But the incident form also carries a "Not Set" option with the
+//                     value -1, which it pre-selects — a non-empty value saying exactly the
+//                     same thing, and one that still leaves the mandatory field unsatisfied.
+//                     Those tickets were left alone and their Acknowledge button stayed
+//                     disabled, which surfaced as "the form still wants something". Both
+//                     unset values now count as unset (CONFIG.UNSET_IMPACT_VALUES); a real
+//                     1/2/3 is still never overwritten.
 // @changelog    0.19 - The red rail down the left edge of the popup is gone — it fought with
 //                     the countdown bar for the same job and only made the card look
 //                     lopsided. Urgency is still carried by the clock, the bottom bar and
@@ -191,10 +201,16 @@
         // so exclude it explicitly.
         EXTRA_FILTER: { incident: 'stateNOT IN7' },
         // Impact written to an incident that has none, purely to clear the mandatory
-        // field blocking its Acknowledge button. Only ever applied to a blank Impact —
+        // field blocking its Acknowledge button. Only ever applied to an unset Impact —
         // an Impact somebody has already judged is never overwritten. 3 = Low, i.e.
         // the least presumptuous value; whoever works the ticket can raise it.
         ACK_FALLBACK_IMPACT: '3',
+        // The Impact values that mean "nobody has judged this yet". '' is the empty
+        // "-- None --" option; '-1' is the "Not Set" option some incident forms carry
+        // and select by default, which is the same statement in a different value and
+        // still blocks the mandatory field. Everything else is a real judgement and is
+        // left alone. Compared as trimmed strings, so keep these as strings.
+        UNSET_IMPACT_VALUES: ['', '-1'],
         // How long the whole acknowledge attempt may take, how long to keep looking
         // for the Acknowledge button while the form finishes rendering, and how often
         // to ask the server whether the acknowledge has landed. The first is generous
@@ -403,14 +419,17 @@
         // ServiceNow derives Priority from Impact × Urgency, overwriting a real Impact
         // would silently re-prioritise the incident. Acknowledging a P1 raised as
         // 1-High would have quietly dropped it to Low and moved its SLA target. An
-        // unset choice comes through as the empty option, so an empty value is the
-        // only safe signal that nobody has judged this ticket's impact yet.
+        // unset choice arrives either as the empty "-- None --" option or as the
+        // "Not Set" option (value -1) that some incident forms carry and pre-select;
+        // both mean nobody has judged this ticket's impact, and both leave the
+        // mandatory field unsatisfied, so both are ours to fill.
         const impactSelect = doc.getElementById('incident.impact');
-        if (impactSelect && !String(impactSelect.value || '').trim()) {
+        if (impactSelect && CONFIG.UNSET_IMPACT_VALUES.includes(String(impactSelect.value || '').trim())) {
+            const wasImpact = String(impactSelect.value || '').trim();
             impactSelect.value = CONFIG.ACK_FALLBACK_IMPACT;
             impactSelect.dispatchEvent(new Event('change', { bubbles: true }));
             impactSelect.dispatchEvent(new Event('input', { bubbles: true }));
-            console.log(`[ACK Monitor] incident had no Impact — set ${CONFIG.ACK_FALLBACK_IMPACT} to satisfy the mandatory field.`);
+            console.log(`[ACK Monitor] incident Impact was unset (${wasImpact === '' ? '-- None --' : `"${wasImpact}"`}) — set ${CONFIG.ACK_FALLBACK_IMPACT} to satisfy the mandatory field.`);
         }
 
         const workNotes = doc.getElementById('activity-stream-work_notes-textarea');
