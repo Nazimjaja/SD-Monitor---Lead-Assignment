@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SD Monitor - OLA Breach Warning
 // @namespace    geodis-sd-monitor
-// @version      0.12
+// @version      0.13
 // @description  Warns every SD agent when a group ticket's resolution OLA crosses 75%, and lets whoever is free take it over on the spot
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
@@ -844,15 +844,26 @@
     // 'unsafe-inline', which silently drops an inline stylesheet. Visual properties
     // are !important-hardened because Next Experience views ship their own
     // !important base rules that otherwise win the specificity fight.
-    GM_addStyle(`
-        #olaRibbon, #olaRibbon *, #olaPanel, #olaPanel * { box-sizing: border-box !important; }
+    //
+    // Split in two because a document stylesheet does not cross a shadow
+    // boundary. The nav the ribbon docks into is nested several open shadow
+    // roots deep, so once the ribbon is appended in there, nothing in the
+    // document's <head> styles it any more — it renders as unstyled inline
+    // text, measures ~0 high, and fails its own dock verification. RIBBON_CSS is
+    // therefore also injected into whichever root the ribbon ends up in (see
+    // adoptRibbonStyles). PANEL_CSS never needs this: the list stays on
+    // document.body precisely so it can't be clipped or unstyled by the header.
+    const RIBBON_CSS = `
+        #olaRibbon, #olaRibbon * { box-sizing: border-box !important; }
 
-        /* The ribbon and the list are two separate nodes now, because the ribbon
-           has to live INSIDE ServiceNow's nav container while the list must not:
+        /* The ribbon and the list are two separate nodes, because the ribbon has
+           to live INSIDE ServiceNow's nav container while the list must not:
            anchoring the list to document.body keeps it clear of whatever
-           overflow/clipping the header chrome applies to its own children. They
-           share a palette and are positioned relative to each other at runtime. */
-        #olaRibbon, #olaPanel {
+           overflow/clipping the header chrome applies to its own children. The
+           palette below is repeated in PANEL_CSS rather than shared in one
+           selector — these two blocks are injected into different roots, so a
+           rule naming both nodes would only ever match one of them. */
+        #olaRibbon {
             /* Polaris nav palette. --nav-dim is #a8bcbe (6.1:1 on --nav); the more
                obvious #8fa3a5 measures 4.0:1 and fails AA for the 10.5px text. */
             --nav: #293e40; --nav-hi: #33494b; --nav-line: rgba(255,255,255,0.13);
@@ -914,7 +925,31 @@
             border-radius: 10px 10px 0 0 !important;
         }
 
+        /* Ribbon contents. These ride with RIBBON_CSS because they only ever
+           appear inside the ribbon, and so have to reach the same root it does. */
+        .olaChevron { font-size: 9px !important; color: var(--nav-dim) !important; flex: 0 0 auto !important; }
+        .olaTitle { font-size: 10px !important; letter-spacing: 0.08em !important; flex: 1 1 auto !important; }
+        .olaCount { font-weight: 700 !important; color: var(--nav-txt) !important; }
+        .olaHeaderBtns { display: flex !important; gap: 4px !important; flex: 0 0 auto !important; }
+        .olaIconBtn {
+            background: transparent !important; border: none !important; border-radius: 4px !important;
+            padding: 3px !important; margin: 0 !important; cursor: pointer !important;
+            color: var(--nav-dim) !important; font-size: 11px !important; line-height: 1 !important;
+            box-shadow: none !important;
+        }
+        .olaIconBtn:hover { background: var(--nav-hi) !important; color: var(--nav-txt) !important; }
+    `;
+
+    const PANEL_CSS = `
+        #olaPanel, #olaPanel * { box-sizing: border-box !important; }
         #olaPanel {
+            --nav: #293e40; --nav-hi: #33494b; --nav-line: rgba(255,255,255,0.13);
+            --nav-txt: #e3ebec; --nav-dim: #a8bcbe; --nav-cap: #93a9ab;
+            --crit: #ff6b6b; --warn: #f5b544;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+            color: var(--nav-txt) !important;
+            z-index: 999999 !important;
+
             position: fixed !important;
             display: none !important;
             flex-direction: column !important;
@@ -927,17 +962,6 @@
         }
         #olaPanel.olaExpanded { display: flex !important; }
         #olaPanel.olaUnderCorner { border-radius: 0 0 10px 10px !important; border-top: none !important; }
-        .olaChevron { font-size: 9px !important; color: var(--nav-dim) !important; flex: 0 0 auto !important; }
-        .olaTitle { font-size: 10px !important; letter-spacing: 0.08em !important; flex: 1 1 auto !important; }
-        .olaCount { font-weight: 700 !important; color: var(--nav-txt) !important; }
-        .olaHeaderBtns { display: flex !important; gap: 4px !important; flex: 0 0 auto !important; }
-        .olaIconBtn {
-            background: transparent !important; border: none !important; border-radius: 4px !important;
-            padding: 3px !important; margin: 0 !important; cursor: pointer !important;
-            color: var(--nav-dim) !important; font-size: 11px !important; line-height: 1 !important;
-            box-shadow: none !important;
-        }
-        .olaIconBtn:hover { background: var(--nav-hi) !important; color: var(--nav-txt) !important; }
 
         /* Collapsed to just the ribbon by default; .olaExpanded (toggled by
            clicking the ribbon, or forced on by setStatus on an error) reveals
@@ -1004,7 +1028,39 @@
         .olaRowMsg { font-size: 10.5px !important; color: var(--crit) !important; padding: 0 6px 5px !important; }
         .olaStatus { font-size: 10px !important; color: var(--nav-cap) !important; text-align: center !important; padding: 7px 8px 9px !important; }
         .olaStatus.olaErr { color: var(--crit) !important; }
-    `);
+    `;
+
+    GM_addStyle(RIBBON_CSS + PANEL_CSS);
+
+    // Gets RIBBON_CSS into whichever root the ribbon is living in. For the
+    // document that is already done above; for a shadow root it is not, and
+    // without it the ribbon is unstyled markup in there — no size, no position,
+    // no colours — which its own verification then correctly rejects.
+    //
+    // A constructed stylesheet rather than a <style> element: SNOW's CSP has no
+    // 'unsafe-inline' in style-src, which drops a <style> we build ourselves
+    // (the same reason this script uses GM_addStyle at all). Constructed sheets
+    // aren't parsed from markup and aren't subject to it. The <style> path stays
+    // as a fallback for anything without adoptedStyleSheets.
+    const styledRoots = new WeakSet();
+    function adoptRibbonStyles(root) {
+        if (!root || root === document || root.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) return;
+        if (styledRoots.has(root)) return;
+        styledRoots.add(root);
+        try {
+            if ('adoptedStyleSheets' in root && typeof CSSStyleSheet === 'function') {
+                const sheet = new CSSStyleSheet();
+                sheet.replaceSync(RIBBON_CSS);
+                root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
+                return;
+            }
+        } catch (e) {
+            console.warn('[OLA Watch] adoptedStyleSheets refused, falling back to <style>', e);
+        }
+        const style = document.createElement('style');
+        style.textContent = RIBBON_CSS;
+        root.appendChild(style);
+    }
 
     // ─── DOM HELPERS ─────────────────────────────────────────────────────────
     // Everything carrying record-derived text goes through these rather than an
@@ -1167,6 +1223,28 @@
         return Math.round(right + gap);
     }
 
+    // The x that `left: 0` would put an absolutely-positioned child at — i.e. the
+    // origin of the coordinate space the nav writes its tabs' inline `left` in.
+    //
+    // Derived from a real tab (measured x minus its own declared left) rather
+    // than from ribbon.offsetParent, which is not reliable here: offsetParent is
+    // specified to return null across a shadow boundary, and this nav sits
+    // several open shadow roots deep. Reading it from a tab needs no guess about
+    // which ancestor establishes the containing block — whatever it is, the tabs
+    // are already positioned against it, and so is the ribbon beside them.
+    // Falls back to the host's own left edge when no tab declares an inline left.
+    function tabOriginX(host, hostLeft) {
+        for (const tab of host.querySelectorAll(CONFIG.DOCK.TAB_SELECTOR)) {
+            if (tab === ribbon || ribbon.contains(tab)) continue;
+            const declared = parseFloat(tab.style.left);
+            if (!Number.isFinite(declared)) continue;
+            const rect = tab.getBoundingClientRect();
+            if (rect.width <= 0) continue;
+            return rect.left - declared;
+        }
+        return hostLeft;
+    }
+
     function tabRectsIn(host) {
         return [...host.querySelectorAll(CONFIG.DOCK.TAB_SELECTOR)]
             .filter(t => t !== ribbon && !ribbon.contains(t))
@@ -1187,10 +1265,10 @@
     // instead of pushing it along.
     function layoutRibbon() {
         if (dockMode !== 'docked' || !ribbon || !dockHost || !dockHost.isConnected) return;
-        const origin = ribbon.offsetParent || dockHost;
-        const originRect = origin.getBoundingClientRect();
+        const originRect = dockHost.getBoundingClientRect();
         const rects = tabRectsIn(dockHost);
-        const left = firstFreeX(originRect.left, rects, CONFIG.DOCK.GAP_PX);
+        const originX = tabOriginX(dockHost, originRect.left);
+        const left = firstFreeX(originX, rects, CONFIG.DOCK.GAP_PX);
 
         // Vertical geometry is copied from a real tab rather than guessed — the
         // tabs set no `top` at all, so matching one is the only way to sit on
@@ -1353,6 +1431,10 @@
         dockMode = 'docked';
         ribbon.className = 'olaDocked' + (panelExpanded ? ' olaExpanded' : '');
         dockHost.appendChild(ribbon);
+        // Before any measuring: inside a shadow root the ribbon has no styles
+        // until this runs, so laying out or verifying first would measure an
+        // unstyled box and reject a dock that is actually fine.
+        adoptRibbonStyles(ribbon.getRootNode());
         layoutRibbon();
 
         requestAnimationFrame(() => requestAnimationFrame(() => {
