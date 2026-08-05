@@ -9,7 +9,11 @@
 const path = require('path');
 const fs = require('fs');
 
-const SCRIPT_PATH = path.join(__dirname, '..', 'OLA ACK.user.js');
+const SCRIPT_PATHS = {
+    ack: path.join(__dirname, '..', 'OLA ACK.user.js'),
+    watch: path.join(__dirname, '..', 'OLA Watch.user.js')
+};
+const SCRIPT_PATH = SCRIPT_PATHS.ack;   // the default this harness was written for
 const SNOW_ORIGIN = 'https://test.service-now.com';
 const TOKEN = 'a'.repeat(40); // any 32+ char string satisfies the g_ck length check
 
@@ -22,8 +26,10 @@ function loadPlaywright() {
     throw new Error('Playwright not found — run `npm install` in tests/, or point NODE_PATH at a global install.');
 }
 
-function readUserscript() {
-    return fs.readFileSync(SCRIPT_PATH, 'utf8');
+function readUserscript(which = 'ack') {
+    const file = SCRIPT_PATHS[which];
+    if (!file) throw new Error(`Unknown userscript "${which}" — expected one of ${Object.keys(SCRIPT_PATHS).join(', ')}`);
+    return fs.readFileSync(file, 'utf8');
 }
 
 // Minimal but faithful GM_* implementations. GM storage is per-page here, which
@@ -46,6 +52,8 @@ async function installGmStubs(page, version = '0.0-test') {
             document.head.appendChild(el);
         };
         window.GM_info = { script: { version: v } };
+        // The Watch script grants this one; the ACK script doesn't use it.
+        window.GM_notification = () => {};
         window.unsafeWindow = window;
         // What the script reads to identify the signed-in agent.
         window.g_user_id = 'USER123';
@@ -86,7 +94,7 @@ function ticketRecord(over = {}) {
     };
 }
 
-async function startSnowPage(browser, { handler, version, colorScheme, viewport } = {}) {
+async function startSnowPage(browser, { handler, version, colorScheme, viewport, script = 'ack', body } = {}) {
     const page = await browser.newPage({
         viewport: viewport || { width: 1000, height: 760 },
         colorScheme: colorScheme || 'light'
@@ -94,7 +102,11 @@ async function startSnowPage(browser, { handler, version, colorScheme, viewport 
     await installRoutes(page, handler || (() => null));
     await installGmStubs(page, version);
     await page.goto(SNOW_ORIGIN + '/');
-    await page.evaluate(readUserscript());
+    // `body` lets a suite stand up real page markup (e.g. the Polaris header) for
+    // the script to find. Injected into the live document rather than via
+    // setContent, which would re-navigate and take the GM stubs and g_ck with it.
+    if (body) await page.evaluate(markup => { document.body.insertAdjacentHTML('beforeend', markup); }, body);
+    await page.evaluate(readUserscript(script));
     return page;
 }
 

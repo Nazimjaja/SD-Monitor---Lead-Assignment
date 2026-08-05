@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SD Monitor - OLA Breach Warning
 // @namespace    geodis-sd-monitor
-// @version      0.11
+// @version      0.12
 // @description  Warns every SD agent when a group ticket's resolution OLA crosses 75%, and lets whoever is free take it over on the spot
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
@@ -98,17 +98,51 @@
         SOUND_ENABLED: true,
         NOTIFY_ENABLED: true,
 
-        // A plain fixed-position overlay, deliberately NOT anchored to any
-        // ServiceNow-internal DOM (no nav lookup, no shadow-root walking). An
-        // earlier version tried docking to the real Favorites nav's geometry
-        // and, separately, injecting a matching favourite entry into it —
-        // both were real, verified-working pieces of code (confirmed against
-        // a real Chromium instance, including real shadow-root cases), but
-        // neither could be confirmed actually finding anything on the real
-        // ServiceNow instance across several rounds, and there's no way to
-        // keep debugging blind DOM assumptions against a page this script
-        // can't see. A fixed corner has no such dependency: it either renders
-        // or it doesn't, with nothing in between to go silently wrong.
+        // Where the ribbon lives. Two earlier attempts docked it into the real
+        // Polaris nav — both worked in a local Chromium, neither could be
+        // confirmed to find anything on the real instance, and the script was
+        // moved to a fixed corner that has no DOM dependency at all.
+        //
+        // Docking is back because the actual markup is now known rather than
+        // guessed (`.sn-polaris-navigation.polaris-header-menu[role=menu]`,
+        // holding absolutely-positioned `.sn-polaris-tab` children — All,
+        // Favorites, History, the ⋮ overflow). What is different this time is
+        // that nothing depends on the attempt succeeding: tryDock() proves the
+        // ribbon is really on screen, really on top and really clear of the
+        // other tabs before keeping it there, and falls back to the same fixed
+        // corner as before if it can't. The corner is still the floor.
+        DOCK: {
+            ENABLED: true,
+
+            // Tried in order, in the light DOM and in any open shadow root.
+            // The first is the exact container the tabs live in; the rest are
+            // progressively looser in case a Polaris release renames the
+            // decorative class but keeps the structural one.
+            HOST_SELECTORS: [
+                '.sn-polaris-navigation.polaris-header-menu[role="menu"]',
+                '.polaris-header-menu[role="menu"]',
+                '.sn-polaris-navigation[role="menu"]'
+            ],
+            // What counts as one of the nav's own tabs, for "put mine after
+            // the last one" and for the overlap check.
+            TAB_SELECTOR: '.sn-polaris-tab',
+
+            // Gap between the ⋮ overflow tab and the ribbon, and the breathing
+            // room left after the ribbon when the host's min-width is widened
+            // to actually reserve the space (see layoutRibbon).
+            GAP_PX: 10,
+            TAIL_PX: 8,
+
+            // The nav is built by ServiceNow's own JS well after DOMContentLoaded,
+            // so the host is polled for rather than read once. Giving up just
+            // means the corner, which is a working UI, so this waits minutes
+            // rather than seconds — a slow instance shouldn't cost the dock.
+            POLL_MS: 500,
+            MAX_WAIT_MS: 120000
+        },
+
+        // The fixed corner: both the fallback when docking can't be verified and
+        // the layout the ribbon keeps on any page with no Polaris nav at all.
         // top:64px clears ServiceNow's own global header bar; left:12px sits
         // clear of the nav without needing to know anything about it.
         PANEL_TOP: 64,
@@ -811,50 +845,88 @@
     // are !important-hardened because Next Experience views ship their own
     // !important base rules that otherwise win the specificity fight.
     GM_addStyle(`
-        #olaPanel, #olaPanel * { box-sizing: border-box !important; }
-        #olaPanel {
+        #olaRibbon, #olaRibbon *, #olaPanel, #olaPanel * { box-sizing: border-box !important; }
+
+        /* The ribbon and the list are two separate nodes now, because the ribbon
+           has to live INSIDE ServiceNow's nav container while the list must not:
+           anchoring the list to document.body keeps it clear of whatever
+           overflow/clipping the header chrome applies to its own children. They
+           share a palette and are positioned relative to each other at runtime. */
+        #olaRibbon, #olaPanel {
             /* Polaris nav palette. --nav-dim is #a8bcbe (6.1:1 on --nav); the more
                obvious #8fa3a5 measures 4.0:1 and fails AA for the 10.5px text. */
             --nav: #293e40; --nav-hi: #33494b; --nav-line: rgba(255,255,255,0.13);
             --nav-txt: #e3ebec; --nav-dim: #a8bcbe; --nav-cap: #93a9ab;
             --crit: #ff6b6b; --warn: #f5b544;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+            color: var(--nav-txt) !important;
+            /* Above the ACK monitor's #sdmStatusIndicator (999998). Docked, this
+               also has to clear the header's own stacking context so the ribbon
+               isn't painted under a neighbouring tab. */
+            z-index: 999999 !important;
+        }
 
-            /* Always mounted and always at least partially visible (the
-               collapsed header) — there is no display:none gate any more.
-               A plain fixed corner, not copied from any ServiceNow DOM. */
+        /* Always mounted and always visible in one of two modes — there is no
+           display:none gate. .olaDocked is the ribbon sitting in the Polaris nav
+           beside All / Favorites / History; .olaCorner is the standalone fixed
+           corner it falls back to. */
+        #olaRibbon {
+            display: flex !important; align-items: center !important; gap: 5px !important;
+            margin: 0 !important;
+            font-size: 10px !important; letter-spacing: 0.08em !important; text-transform: uppercase !important;
+            color: var(--nav-cap) !important;
+            cursor: pointer !important;
+            white-space: nowrap !important;
+        }
+
+        /* Docked: a compact pill, absolutely positioned like every other tab in
+           that container. left/top/height are written by layoutRibbon from the
+           real tabs' measured geometry — never assumed here, because the nav
+           positions its own children with inline styles it recomputes. */
+        #olaRibbon.olaDocked {
+            position: absolute !important;
+            padding: 0 9px !important;
+            border-radius: 7px !important;
+            background: rgba(255,255,255,0.09) !important;
+            border: 1px solid var(--nav-line) !important;
+        }
+        #olaRibbon.olaDocked:hover { background: rgba(255,255,255,0.17) !important; }
+        /* Expanded reads as pressed, the way an open menu tab does. */
+        #olaRibbon.olaDocked.olaExpanded { background: rgba(255,255,255,0.17) !important; }
+
+        /* Corner: the original standalone header, unchanged. */
+        #olaRibbon.olaCorner {
             position: fixed !important;
             top: ${CONFIG.PANEL_TOP}px !important;
             left: ${CONFIG.PANEL_LEFT}px !important;
             width: ${CONFIG.PANEL_WIDTH}px !important;
-            display: flex !important;
+            padding: 9px 10px !important;
+            background: var(--nav) !important;
+            border: 1px solid var(--nav-line) !important;
+            border-radius: 10px !important;
+            box-shadow: 0 6px 20px -4px rgba(0,0,0,0.45) !important;
+        }
+        #olaRibbon.olaCorner:hover { background: var(--nav-hi) !important; }
+        /* Corner mode anchors the list flush underneath, so the two nodes have to
+           read as one box: the seam between them loses its radius. */
+        #olaRibbon.olaCorner.olaExpanded {
+            border-bottom: 1px solid var(--nav-line) !important;
+            border-radius: 10px 10px 0 0 !important;
+        }
+
+        #olaPanel {
+            position: fixed !important;
+            display: none !important;
             flex-direction: column !important;
+            width: ${CONFIG.PANEL_WIDTH}px !important;
             padding: 0 !important;
             background: var(--nav) !important;
             border: 1px solid var(--nav-line) !important;
             border-radius: 10px !important;
             box-shadow: 0 6px 20px -4px rgba(0,0,0,0.45) !important;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
-            color: var(--nav-txt) !important;
-            /* Above the ACK monitor's #sdmStatusIndicator (999998), which docks
-               the bottom-left corner — this panel no longer shares that
-               corner, but there's no reason to risk losing a future
-               stacking fight either. */
-            z-index: 999999 !important;
         }
-
-        .olaHeader {
-            display: flex !important; align-items: center !important; gap: 5px !important;
-            padding: 9px 10px !important; margin: 0 !important;
-            font-size: 10px !important; letter-spacing: 0.08em !important; text-transform: uppercase !important;
-            color: var(--nav-cap) !important;
-            cursor: pointer !important;
-            border-radius: 10px !important;
-        }
-        #olaPanel.olaExpanded .olaHeader {
-            border-bottom: 1px solid var(--nav-line) !important;
-            border-radius: 10px 10px 0 0 !important;
-        }
-        .olaHeader:hover { background: var(--nav-hi) !important; }
+        #olaPanel.olaExpanded { display: flex !important; }
+        #olaPanel.olaUnderCorner { border-radius: 0 0 10px 10px !important; border-top: none !important; }
         .olaChevron { font-size: 9px !important; color: var(--nav-dim) !important; flex: 0 0 auto !important; }
         .olaTitle { font-size: 10px !important; letter-spacing: 0.08em !important; flex: 1 1 auto !important; }
         .olaCount { font-weight: 700 !important; color: var(--nav-txt) !important; }
@@ -867,13 +939,10 @@
         }
         .olaIconBtn:hover { background: var(--nav-hi) !important; color: var(--nav-txt) !important; }
 
-        /* Collapsed to just the header by default; .olaExpanded (toggled by
-           clicking the header, or forced on by setStatus on an error) reveals
-           the list and status line below it. */
-        .olaBody, .olaStatus { display: none !important; }
-        #olaPanel.olaExpanded .olaBody { display: block !important; }
-        #olaPanel.olaExpanded .olaStatus { display: block !important; }
-
+        /* Collapsed to just the ribbon by default; .olaExpanded (toggled by
+           clicking the ribbon, or forced on by setStatus on an error) reveals
+           the list and status line, which live in #olaPanel and are shown by the
+           #olaPanel.olaExpanded rule above. */
         .olaBody {
             max-height: min(46vh, 380px) !important;
             overflow-y: auto !important;
@@ -950,7 +1019,12 @@
     }
 
     // ─── PANEL ───────────────────────────────────────────────────────────────
+    // Two nodes: the ribbon (always visible, docked into ServiceNow's nav when
+    // that can be verified, otherwise a fixed corner) and the panel holding the
+    // list + status, which always hangs off document.body and is positioned
+    // under the ribbon at runtime.
     let panel = null;
+    let ribbon = null;
     let muteBtn = null;
 
     function syncMuteBtn() {
@@ -973,7 +1047,20 @@
         panel = document.createElement('div');
         panel.id = 'olaPanel';
 
-        const header = el('div', 'olaHeader');
+        // Starts in corner mode. tryDock() promotes it into the nav only once
+        // it has proved the result is visible and unobstructed, so the worst case
+        // is the layout this script already had.
+        ribbon = document.createElement('div');
+        ribbon.id = 'olaRibbon';
+        ribbon.className = 'olaCorner';
+        // role/tabindex so it reads as what it is once it's sitting in a
+        // role="menu" container alongside ServiceNow's own menuitems.
+        ribbon.setAttribute('role', 'menuitem');
+        ribbon.setAttribute('tabindex', '0');
+        ribbon.setAttribute('aria-label', 'OLA Watch');
+        ribbon.setAttribute('aria-haspopup', 'true');
+
+        const header = ribbon;
         header.title = 'Click to expand/collapse';
         const chevron = el('span', 'olaChevron', '▸');
         chevron.id = 'olaChevron';
@@ -996,10 +1083,16 @@
         btns.append(muteBtn, refreshBtn);
         header.appendChild(btns);
 
-        header.addEventListener('click', e => {
+        const toggle = e => {
             if (e.target.closest('button')) return;
             panelExpanded = !panelExpanded;
             renderPanel();
+        };
+        header.addEventListener('click', toggle);
+        header.addEventListener('keydown', e => {
+            if (e.key !== 'Enter' && e.key !== ' ') return;
+            e.preventDefault();
+            toggle(e);
         });
 
         const body = el('div', 'olaBody');
@@ -1008,16 +1101,352 @@
         const status = el('div', 'olaStatus', 'starting…');
         status.id = 'olaStatus';
 
-        panel.append(header, body, status);
-        document.body.appendChild(panel);
+        panel.append(body, status);
+        document.body.append(ribbon, panel);
+        positionPanel();
     }
 
-    // The only thing left to guard against, now that positioning is a plain
-    // CSS fixed corner instead of geometry copied from ServiceNow's own DOM:
-    // the node itself getting detached from something upstream (a full page
-    // teardown/rebuild, an extension conflict). Re-checked every second.
+    // ─── DOCKING INTO THE POLARIS NAV ────────────────────────────────────────
+    // The nav container holds absolutely-positioned `.sn-polaris-tab` children
+    // whose `left` ServiceNow computes and recomputes itself (they animate, they
+    // shuffle when one is pinned, and they carry an `unpinnedleft` attribute for
+    // the position they return to). Nothing here hard-codes any of that: the
+    // ribbon is placed after the measured right edge of the last real tab, and
+    // re-placed whenever the nav moves anything.
+    let dockHost = null;
+    let dockMode = 'corner';           // 'docked' | 'corner'
+    let dockNote = 'not attempted yet';
+    let dockHostMinWidth = null;       // the host's own inline min-width, to restore
+    let dockObservers = [];
+    let applyingLayout = false;        // our own writes must not re-trigger the observers
+    // Set once a found-but-unusable nav has been rejected for good. Without it the
+    // startup poller keeps re-attempting every POLL_MS, and since each attempt
+    // appends the ribbon before it can verify anything, the agent watches it flick
+    // between the nav and the corner twice a second for two minutes.
+    let dockGaveUp = false;
+    let dockPending = false;           // one attempt chain at a time
+
+    // querySelector that also descends into open shadow roots. Polaris is a
+    // web-component UI, so the nav can legitimately sit inside one — and a plain
+    // document.querySelector would report "not on this page" for a node that is
+    // very much on this page. Closed roots stay invisible, which is what the
+    // corner fallback is for.
+    function deepQuery(root, selector, depth = 0) {
+        const direct = root.querySelector && root.querySelector(selector);
+        if (direct) return direct;
+        if (depth > 12) return null;
+        const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+        for (const node of all) {
+            if (!node.shadowRoot) continue;
+            const hit = deepQuery(node.shadowRoot, selector, depth + 1);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    function findDockHost() {
+        for (const selector of CONFIG.DOCK.HOST_SELECTORS) {
+            const host = deepQuery(document, selector);
+            if (host) return { host, selector };
+        }
+        return null;
+    }
+
+    // The x (in the tabs' own coordinate space) of the first position that clears
+    // every existing tab. Pure arithmetic over measured rects, kept separate from
+    // the DOM so the self-test can exercise the no-overlap rule directly.
+    // Zero-width tabs are skipped: `#nav-overflow` is an `is-placeholder` when the
+    // menus fit, and a placeholder that reserves 40px of gap it isn't using would
+    // leave the ribbon floating away from the row.
+    function firstFreeX(originX, tabRects, gap) {
+        let right = 0;
+        for (const r of tabRects) {
+            if (!r || r.width <= 0) continue;
+            right = Math.max(right, r.right - originX);
+        }
+        return Math.round(right + gap);
+    }
+
+    function tabRectsIn(host) {
+        return [...host.querySelectorAll(CONFIG.DOCK.TAB_SELECTOR)]
+            .filter(t => t !== ribbon && !ribbon.contains(t))
+            .map(t => t.getBoundingClientRect());
+    }
+
+    function rectsOverlap(a, b) {
+        // 1px of tolerance: sub-pixel layout routinely leaves neighbouring boxes
+        // sharing a fractional edge, and that is touching, not overlapping.
+        return a.left < b.right - 1 && b.left < a.right - 1
+            && a.top < b.bottom - 1 && b.top < a.bottom - 1;
+    }
+
+    // Places the ribbon after the last tab and widens the host to actually
+    // reserve that space. The min-width matters: the tabs are absolutely
+    // positioned, so they take no width of their own, and without it the ribbon
+    // would be drawn over whatever the header puts to the right of the menu
+    // instead of pushing it along.
+    function layoutRibbon() {
+        if (dockMode !== 'docked' || !ribbon || !dockHost || !dockHost.isConnected) return;
+        const origin = ribbon.offsetParent || dockHost;
+        const originRect = origin.getBoundingClientRect();
+        const rects = tabRectsIn(dockHost);
+        const left = firstFreeX(originRect.left, rects, CONFIG.DOCK.GAP_PX);
+
+        // Vertical geometry is copied from a real tab rather than guessed — the
+        // tabs set no `top` at all, so matching one is the only way to sit on
+        // their baseline whatever the header's height turns out to be.
+        const ref = rects.find(r => r.height > 0);
+        const top = ref ? Math.round(ref.top - originRect.top) : null;
+        const height = ref ? Math.round(ref.height) : null;
+        const needed = Math.ceil(left + ribbon.offsetWidth + CONFIG.DOCK.TAIL_PX);
+
+        // Writing values that are already there is not free: widening the host is
+        // a change to ServiceNow's own layout, which can move the tabs, which
+        // brings us back here. Bailing on a no-op is what stops that settling
+        // into a loop instead of settling.
+        const unchanged = ribbon.style.left === left + 'px'
+            && (top === null || ribbon.style.top === top + 'px')
+            && (height === null || ribbon.style.height === height + 'px')
+            && Math.ceil(parseFloat(dockHost.style.minWidth) || 0) === needed;
+        if (unchanged) return;
+
+        applyingLayout = true;
+        try {
+            ribbon.style.left = left + 'px';
+            if (ref) {
+                ribbon.style.top = top + 'px';
+                ribbon.style.height = height + 'px';
+            }
+            dockHost.style.minWidth = needed + 'px';
+        } finally {
+            applyingLayout = false;
+        }
+
+        // Placement is only as good as the room available. If the nav's own tabs
+        // have grown far enough right that clearing them puts the ribbon past the
+        // edge of the window, there is no position in that container that works,
+        // and staying docked would mean a ribbon the agent can't see or click.
+        const r = ribbon.getBoundingClientRect();
+        if (r.left >= window.innerWidth - 8 || r.right <= 0) {
+            dockGaveUp = true;
+            undock('corner fallback — no room left in the nav for the ribbon');
+            console.warn(`[OLA Watch] ${dockNote}`);
+            renderPanel();
+            return;
+        }
+        positionPanel();
+    }
+
+    let layoutQueued = false;
+    function scheduleLayout() {
+        if (applyingLayout || layoutQueued) return;
+        layoutQueued = true;
+        requestAnimationFrame(() => { layoutQueued = false; layoutRibbon(); });
+    }
+
+    // elementFromPoint stops at a shadow host, so a hit test that doesn't
+    // recurse would report the ribbon as "covered" by the very component it
+    // lives inside.
+    function topmostAt(x, y) {
+        let node = document.elementFromPoint(x, y);
+        while (node && node.shadowRoot) {
+            const inner = node.shadowRoot.elementFromPoint(x, y);
+            if (!inner || inner === node) break;
+            node = inner;
+        }
+        return node;
+    }
+
+    // The check the two earlier docking attempts never had: does the ribbon
+    // actually end up on screen, unobstructed, and clear of the nav's own tabs?
+    // Returns null when the dock is good, or a human-readable reason to abandon
+    // it. Everything here is measured after layout, never assumed.
+    function verifyDock() {
+        if (!ribbon.isConnected) return 'ribbon did not stay attached';
+        const r = ribbon.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8) return 'ribbon has no size in the nav';
+        if (r.right <= 0 || r.bottom <= 0 || r.left >= window.innerWidth || r.top >= window.innerHeight) {
+            return 'ribbon landed off-screen';
+        }
+        for (const tabRect of tabRectsIn(dockHost)) {
+            if (tabRect.width > 0 && rectsOverlap(r, tabRect)) return 'ribbon overlaps a nav tab';
+        }
+        // Hit-test near the left edge rather than the centre: the centre can land
+        // on the title text, which is a child and reports as itself.
+        const hit = topmostAt(Math.round(r.left + Math.min(6, r.width / 2)), Math.round(r.top + r.height / 2));
+        if (!hit) return 'nothing hit-tests where the ribbon is';
+        if (hit !== ribbon && !ribbon.contains(hit)) {
+            return `ribbon is painted under <${String(hit.tagName || '?').toLowerCase()}>`;
+        }
+        return null;
+    }
+
+    function disconnectDockObservers() {
+        dockObservers.forEach(o => { try { o.disconnect(); } catch { /* already gone */ } });
+        dockObservers = [];
+    }
+
+    // Back to the corner, leaving the host exactly as it was found — including
+    // its own inline min-width, which we may have widened.
+    function undock(reason) {
+        disconnectDockObservers();
+        if (dockHost && dockHostMinWidth !== null) {
+            if (dockHostMinWidth) dockHost.style.minWidth = dockHostMinWidth;
+            else dockHost.style.removeProperty('min-width');
+        }
+        dockHost = null;
+        dockHostMinWidth = null;
+        dockMode = 'corner';
+        if (ribbon) {
+            ribbon.style.removeProperty('left');
+            ribbon.style.removeProperty('top');
+            ribbon.style.removeProperty('height');
+            ribbon.className = 'olaCorner' + (panelExpanded ? ' olaExpanded' : '');
+            document.body.appendChild(ribbon);
+        }
+        if (reason) dockNote = reason;
+        positionPanel();
+    }
+
+    function observeDock() {
+        disconnectDockObservers();
+        if (!dockHost) return;
+        // The nav rewrites its children's inline `left` (and `unpinnedleft`) as
+        // tabs pin, unpin and animate; anything that moves a tab has to move the
+        // ribbon too, or the gap it was placed in stops being free.
+        const mo = new MutationObserver(records => {
+            if (applyingLayout) return;
+            if (records.every(rec => rec.target === ribbon || ribbon.contains(rec.target))) return;
+            scheduleLayout();
+        });
+        mo.observe(dockHost, {
+            childList: true, subtree: true,
+            attributes: true, attributeFilter: ['style', 'class', 'unpinnedleft']
+        });
+        dockObservers.push(mo);
+
+        if (typeof ResizeObserver === 'function') {
+            const ro = new ResizeObserver(() => scheduleLayout());
+            ro.observe(dockHost);
+            dockObservers.push(ro);
+        }
+        // `can-animate` on the tabs means their final position arrives one
+        // transition later than the mutation that started it.
+        const onTransition = e => { if (e.target !== ribbon) scheduleLayout(); };
+        dockHost.addEventListener('transitionend', onTransition, true);
+        dockObservers.push({ disconnect: () => dockHost && dockHost.removeEventListener('transitionend', onTransition, true) });
+    }
+
+    // One docking attempt. Verification is deferred by two frames because the
+    // nav animates: measuring in the same tick as the append reads a tab
+    // mid-transition and would reject a dock that settles fine a frame later.
+    // A rejected attempt restores everything before falling back.
+    function tryDock(attempt = 0) {
+        if (!CONFIG.DOCK.ENABLED || !ribbon || dockMode === 'docked' || dockGaveUp) return;
+        if (attempt === 0 && dockPending) return;
+        const found = findDockHost();
+        if (!found) { dockNote = 'nav container not found yet'; return; }
+
+        dockPending = true;
+        dockHost = found.host;
+        dockHostMinWidth = dockHost.style.minWidth || '';
+        dockMode = 'docked';
+        ribbon.className = 'olaDocked' + (panelExpanded ? ' olaExpanded' : '');
+        dockHost.appendChild(ribbon);
+        layoutRibbon();
+
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (dockMode !== 'docked') { dockPending = false; return; }
+            layoutRibbon();
+            const problem = verifyDock();
+            if (!problem) {
+                dockPending = false;
+                dockNote = `docked into ${found.selector}`;
+                observeDock();
+                renderPanel();
+                console.log(`[OLA Watch] ribbon ${dockNote}`);
+                return;
+            }
+            // Two more tries before giving up: the nav can still be settling.
+            if (attempt < 2) {
+                undock(`retrying dock — ${problem}`);
+                setTimeout(() => tryDock(attempt + 1), 400);
+                return;
+            }
+            // Found the nav, can't use it. Retrying that forever would just be a
+            // flicker, so this is final until __olaWatchDebug.dock() asks again.
+            // (A nav rebuilt under a working dock is a different path, and
+            // ensurePanelAttached still re-docks for that one.)
+            dockPending = false;
+            dockGaveUp = true;
+            undock(`corner fallback — ${problem}`);
+            console.warn(`[OLA Watch] ${dockNote}`);
+            renderPanel();
+        }));
+    }
+
+    // The nav is built by ServiceNow's own JS long after this script runs, so the
+    // host is polled for rather than read once. Giving up costs only the dock —
+    // the corner is a working UI — so this waits minutes, not seconds.
+    function startDocking() {
+        if (!CONFIG.DOCK.ENABLED) { dockNote = 'disabled in CONFIG'; return; }
+        const deadline = Date.now() + CONFIG.DOCK.MAX_WAIT_MS;
+        const timer = setInterval(() => {
+            if (dockMode === 'docked' || dockGaveUp || Date.now() > deadline) {
+                clearInterval(timer);
+                if (dockMode !== 'docked' && !dockGaveUp) {
+                    dockNote = 'corner fallback — nav container never appeared';
+                }
+                return;
+            }
+            tryDock();
+        }, CONFIG.DOCK.POLL_MS);
+        tryDock();
+    }
+
+    // The list hangs off document.body rather than the nav, so it can't be
+    // clipped by the header's own overflow — which means its position has to be
+    // written from the ribbon's measured box every time either one moves.
+    function positionPanel() {
+        if (!panel || !ribbon) return;
+        const docked = dockMode === 'docked';
+        panel.classList.toggle('olaUnderCorner', !docked);
+        const r = ribbon.getBoundingClientRect();
+        // Corner mode keeps the two boxes flush, so they read as the single panel
+        // this used to be; docked, the list is a dropdown clear of the nav.
+        const top = r.bottom + (docked ? 6 : 0);
+        // Left-aligned with the ribbon by default; right-aligned to it when that
+        // would run off the edge. Docked, the ribbon sits at the right-hand end
+        // of the nav, so left-aligning a 248px list there routinely overflows —
+        // and a list that just slides left until it fits reads as detached from
+        // the thing it belongs to. Clamping is the last resort, for a viewport
+        // too narrow for either.
+        const overflowsLeftAligned = r.left + CONFIG.PANEL_WIDTH > window.innerWidth - 6;
+        const preferred = overflowsLeftAligned ? r.right - CONFIG.PANEL_WIDTH : r.left;
+        const maxLeft = window.innerWidth - CONFIG.PANEL_WIDTH - 6;
+        const left = Math.max(6, Math.min(preferred, Math.max(6, maxLeft)));
+        panel.style.left = Math.round(left) + 'px';
+        panel.style.top = Math.round(top) + 'px';
+    }
+
+    // A detached ribbon or panel is the one failure a fixed corner couldn't have
+    // (a full page teardown/rebuild, an extension conflict) — and, docked, the
+    // nav being rebuilt under us. Re-checked every second.
     function ensurePanelAttached() {
         if (panel && !panel.isConnected) document.body.appendChild(panel);
+        if (!ribbon) return;
+        if (dockMode === 'docked') {
+            if (!ribbon.isConnected || !dockHost || !dockHost.isConnected) {
+                // The nav was replaced: re-dock against the new one rather than
+                // leaving the ribbon stranded in a container nobody can see.
+                undock('nav was rebuilt — re-docking');
+                tryDock();
+            } else {
+                layoutRibbon();
+            }
+        } else if (!ribbon.isConnected) {
+            document.body.appendChild(ribbon);
+        }
     }
 
 
@@ -1041,6 +1470,8 @@
         if (isError) {
             panelExpanded = true;
             panel.classList.add('olaExpanded');
+            if (ribbon) ribbon.classList.add('olaExpanded');
+            positionPanel();
         }
     }
 
@@ -1079,8 +1510,11 @@
         if (!body) return;
 
         panel.classList.toggle('olaExpanded', panelExpanded);
-        const chevron = panel.querySelector('#olaChevron');
+        ribbon.classList.toggle('olaExpanded', panelExpanded);
+        ribbon.setAttribute('aria-expanded', String(panelExpanded));
+        const chevron = ribbon.querySelector('#olaChevron');
         if (chevron) chevron.textContent = panelExpanded ? '▾' : '▸';
+        positionPanel();
 
         body.replaceChildren();
         const myId = getMyId();
@@ -1170,8 +1604,11 @@
         addGroup('Breaching soon', 'olaCrit', '▲', rows.filter(isCrit));
         addGroup('Watch', 'olaWarn', '●', rows.filter(r => !isCrit(r)));
 
-        const countEl = panel.querySelector('#olaCount');
+        const countEl = ribbon.querySelector('#olaCount');
         if (countEl) countEl.textContent = String(rows.length);
+        // The ribbon's own width changes with the count (1 → 12 rows), and docked
+        // that width is what the reserved space in the nav is measured from.
+        if (dockMode === 'docked') scheduleLayout();
 
         if (state.error) {
             setStatus(`Error: ${state.error}`, true);
@@ -1371,6 +1808,12 @@
     // ─── INIT ────────────────────────────────────────────────────────────────
     buildPanel();
     renderPanel();
+    startDocking();
+    // Docked, the ribbon moves with the header; either way the list is a fixed
+    // box that has to be re-anchored when anything moves under it. Capture-phase
+    // scroll so a scroll inside SNOW's own containers counts, not just the window.
+    window.addEventListener('resize', () => { scheduleLayout(); positionPanel(); });
+    window.addEventListener('scroll', () => positionPanel(), true);
     setInterval(tickClocks, 1000);
     setInterval(() => { if (takesInFlight === 0) renderPanel(); }, 15000); // catch TTL/stale drift
     setInterval(ensurePanelAttached, 1000);
@@ -1399,22 +1842,36 @@
             return { sessionBroken, hasToken: !!sessionToken };
         },
 
-        // Answers "why can't I see the panel?" now that it's a plain fixed
-        // corner with no ServiceNow DOM dependency — if attached+visible
-        // both come back true here and it's STILL not visible on screen,
-        // that points at something else entirely (another element painted
-        // on top at a higher z-index, a page-level CSS transform, etc.)
-        // rather than anything this script's own logic could be getting
-        // wrong about finding a target element.
+        // Answers both "why can't I see the panel?" and "why didn't it dock?".
+        // `dock` is the reason in words — the nav never appeared, or it appeared
+        // and the ribbon failed verification (off-screen, covered, overlapping a
+        // tab), each of which sends it back to the corner rather than leaving a
+        // ribbon nobody can see. If attached+rect look right here and it is STILL
+        // not on screen, that points at something outside this script's logic
+        // (another element painted on top, a page-level CSS transform).
         panelStatus() {
             const info = {
                 attached: !!(panel && panel.isConnected),
+                ribbonAttached: !!(ribbon && ribbon.isConnected),
                 expanded: panelExpanded,
-                rect: panel ? panel.getBoundingClientRect() : null
+                mode: dockMode,
+                dock: dockNote,
+                dockHostFound: !!findDockHost(),
+                ribbonRect: ribbon ? ribbon.getBoundingClientRect() : null,
+                rect: panel ? panel.getBoundingClientRect() : null,
+                overlapsATab: dockMode === 'docked' && ribbon
+                    ? tabRectsIn(dockHost).some(t => t.width > 0 && rectsOverlap(ribbon.getBoundingClientRect(), t))
+                    : false
             };
             console.log('[OLA Watch] panel:', info);
             return info;
         },
+
+        // Force the ribbon between the two layouts without reloading — for
+        // checking the corner fallback still looks right, or for retrying the
+        // dock after the nav has finished building.
+        dock() { dockGaveUp = false; if (dockMode !== 'docked') tryDock(); return dockNote; },
+        undock() { dockGaveUp = true; undock('corner forced from the console'); renderPanel(); return dockNote; },
         pollStatus() {
             const last = readLastPoll();
             console.log('[OLA Watch] last poll:', last,
@@ -1583,6 +2040,34 @@
             check('duration empty', parseSnowDuration('') === null);
             check('duration zero', parseSnowDuration('1970-01-01 00:00:00') === null);
             check('duration junk', parseSnowDuration('not a duration') === null);
+
+            // ── Ribbon placement ────────────────────────────────────────────────
+            // firstFreeX is the whole no-overlap rule: the ribbon goes after the
+            // right edge of the furthest-right tab, in the tabs' own coordinate
+            // space, never at a hard-coded offset. Rects here are the real ones
+            // from the Polaris nav (All/Favorites/History/⋮ at left 332/320/378/458
+            // in a container starting at x=100), so a regression in the arithmetic
+            // shows up as a number, not as a screenshot nobody looks at.
+            const rect = (left, width) => ({ left, right: left + width, width, top: 0, bottom: 32, height: 32 });
+            const navTabs = [rect(432, 30), rect(420, 62), rect(478, 48), rect(558, 24)];
+            check('ribbon clears the last tab', firstFreeX(100, navTabs, 10) === 492);
+            // A zero-width tab is the ⋮ overflow sitting as `is-placeholder`; it
+            // reserves nothing, so it must not push the ribbon out past a gap of air.
+            check('zero-width tabs reserve nothing', firstFreeX(100, [rect(432, 30), rect(600, 0)], 10) === 372);
+            check('no tabs at all → just the gap', firstFreeX(100, [], 10) === 10);
+            check('ribbon never lands left of the origin', firstFreeX(100, [rect(0, 0)], 10) === 10);
+            // Order doesn't matter — it's the furthest right edge that counts, and
+            // the nav's inline `left` values are not in visual order (Favorites is
+            // pinned at 320 while All sits at 332).
+            check('placement is order-independent', firstFreeX(100, [...navTabs].reverse(), 10) === firstFreeX(100, navTabs, 10));
+
+            // Sharing an edge is touching, not overlapping — sub-pixel layout does
+            // this constantly and a false positive here would reject a good dock.
+            check('adjacent rects do not overlap', rectsOverlap(rect(0, 100), rect(100, 50)) === false);
+            check('overlapping rects are caught', rectsOverlap(rect(0, 100), rect(50, 50)) === true);
+            check('a rect inside another overlaps', rectsOverlap(rect(0, 100), rect(20, 10)) === true);
+            check('vertically clear rects do not overlap',
+                rectsOverlap({ left: 0, right: 100, top: 0, bottom: 10 }, { left: 0, right: 100, top: 20, bottom: 30 }) === false);
 
             // Threshold selection returns the MOST severe NOTIFY_AT point crossed,
             // not the first. NOTIFY_AT is [75] by default.

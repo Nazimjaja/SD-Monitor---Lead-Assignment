@@ -3,7 +3,7 @@
 // pre-push check or a CI step. Run one suite on its own with, e.g.:
 //   node tests/acknowledge.test.js
 
-const SUITES = ['session', 'acknowledge', 'popup'];
+const SUITES = ['session', 'acknowledge', 'popup', 'dock'];
 
 (async () => {
     const only = process.argv[2];
