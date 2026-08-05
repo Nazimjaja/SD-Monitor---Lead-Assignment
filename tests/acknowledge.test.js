@@ -12,8 +12,9 @@ const { loadPlaywright, json, html, ticketRecord, startSnowPage, createResults }
 
 const FIELDS = `
   <select id="incident.impact">
-    <option value=""></option><option value="1">1 - High</option>
+    <option value="">-- None --</option><option value="1">1 - High</option>
     <option value="2">2 - Medium</option><option value="3">3 - Low</option>
+    <option value="-1">Not Set</option>
   </select>
   <textarea id="activity-stream-work_notes-textarea"></textarea>`;
 
@@ -131,6 +132,14 @@ async function run() {
     const filled = await attempt(browser, 'navigates', { impact: '' });
     r.check('a blank Impact is filled so the button unblocks', filled.acked && filled.submittedImpact === '3',
         `submitted impact=${JSON.stringify(filled.submittedImpact)}`);
+
+    // "Not Set" (-1) is the form's other way of saying nobody has judged this. It is a
+    // non-empty value, so the blank-only check in 0.12 skipped it and left the mandatory
+    // field — and the Acknowledge button — blocked.
+    const notSet = await attempt(browser, 'navigates', { impact: '-1' });
+    r.check('an Impact of "Not Set" (-1) counts as unset and is filled',
+        notSet.acked && notSet.submittedImpact === '3',
+        `submitted impact=${JSON.stringify(notSet.submittedImpact)}`);
 
     const silent = await attempt(browser, 'silentSave');
     r.check('a save without a navigation still counts', silent.acked, `${silent.seconds.toFixed(1)}s`);
