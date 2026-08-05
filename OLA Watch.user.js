@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SD Monitor - OLA Breach Warning
 // @namespace    geodis-sd-monitor
-// @version      0.10
+// @version      0.11
 // @description  Warns every SD agent when a group ticket's resolution OLA crosses 75%, and lets whoever is free take it over on the spot
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
@@ -44,9 +44,16 @@
         // the first thing to check — see __olaWatchDebug.listSlaNames().
         OLA_NAME: 'INC-RES-CORP-SD',
 
-        // The OLA's business schedule: (Geo) FR, Mon–Fri 08:00–19:00, Europe/Paris
-        // (CET/CEST — handled below via Intl, not a fixed UTC offset), excluding
-        // French public holidays. Drives computePct's business-time math, below.
+        // The business schedule to assume for OLAs whose clock actually pauses:
+        // (Geo) FR, Mon–Fri 08:00–19:00, Europe/Paris (CET/CEST — handled below via
+        // Intl, not a fixed UTC offset), excluding French public holidays.
+        //
+        // This is NOT applied to every row. Whether a given OLA's clock pauses at
+        // all is decided per row by clockPauses() from the SLA's own duration and
+        // timestamps — see the comment there. Applying this schedule unconditionally
+        // is what made a 24/7 OLA opened at 18:32 read as 75% consumed 21 minutes
+        // later: only the 28 minutes before the 19:00 close were counted as its
+        // window, so 21 minutes of a 60-minute OLA divided by 28 rather than 60.
         SCHEDULE: {
             TIMEZONE: 'Europe/Paris',
             WORKDAYS: [1, 2, 3, 4, 5], // getUTCDay(): 0=Sun … 6=Sat
@@ -277,6 +284,14 @@
     const OLA_FIELDS = [
         'sys_id', 'stage', 'percentage', 'has_breached', 'start_time', 'planned_end_time',
         'sla.name',
+        // The three fields clockPauses() needs to decide whether this OLA's clock
+        // runs continuously or pauses outside a schedule. `sla.duration` is the
+        // primary signal (compared against the row's own start→planned_end span);
+        // `sla.schedule` / `sla.schedule_source` are the fallback for a definition
+        // whose duration doesn't parse. An instance that doesn't have
+        // schedule_source simply omits it from the response — fieldVal returns ''
+        // and the fallback still works off the schedule reference alone.
+        'sla.duration', 'sla.schedule', 'sla.schedule_source',
         'task.sys_id', 'task.number', 'task.sys_class_name',
         'task.short_description', 'task.assigned_to', 'task.priority'
     ].join(',');
@@ -321,6 +336,9 @@
             hasBreached: String(fieldVal(rec, 'has_breached')) === 'true',
             start:       fieldVal(rec, 'start_time'),
             plannedEnd:  fieldVal(rec, 'planned_end_time'),
+            slaDuration: fieldVal(rec, 'sla.duration'),
+            slaSchedule: fieldVal(rec, 'sla.schedule'),
+            scheduleSource: fieldVal(rec, 'sla.schedule_source'),
             table:       fieldVal(rec, 'task.sys_class_name') || 'task',
             taskSysId:   fieldVal(rec, 'task.sys_id'),
             number:      fieldDisplay(rec, 'task.number'),
@@ -476,6 +494,65 @@
         return Date.UTC(Y, Mo - 1, D, H, Mi, S);
     }
 
+    // A glide_duration `value` is a datetime offset from the 1970-01-01 epoch —
+    // "1970-01-01 01:00:00" is one hour, "1970-01-02 03:00:00" is 27. Some
+    // instances hand back the bare clock form instead, so both are accepted.
+    const DURATION_EPOCH = Date.UTC(1970, 0, 1);
+    function parseSnowDuration(value) {
+        if (!value) return null;
+        const raw = String(value).trim();
+        const asDate = parseSnowUtc(raw);
+        if (asDate != null) {
+            const ms = asDate - DURATION_EPOCH;
+            return ms > 0 ? ms : null;
+        }
+        const m = /^(?:(\d+)\s+days?[, ]\s*)?(\d+):(\d{2}):(\d{2})$/.exec(raw);
+        if (!m) return null;
+        const ms = ((+(m[1] || 0) * 24 + +m[2]) * 3600 + +m[3] * 60 + +m[4]) * 1000;
+        return ms > 0 ? ms : null;
+    }
+
+    // Does this OLA's clock stop outside business hours, or does it run straight
+    // through? Everything downstream — the percentage, the countdown, and therefore
+    // the "Breaching soon" label and the notification — depends on the answer, and
+    // this script used to never ask the question: it applied CONFIG.SCHEDULE to
+    // every row unconditionally. On a 24/7 OLA that inflates the percentage by
+    // shrinking the window it divides by, which is what put a 21-minute-old ticket
+    // on screen at 75%.
+    //
+    // The primary signal is the row's own arithmetic, which needs no assumption
+    // about WHICH schedule is in force and works even for one this script can't
+    // model (24/5, a second site's hours, a schedule attached to the task rather
+    // than the definition):
+    //
+    //   planned_end_time − start_time  ==  the SLA definition's duration
+    //     → the clock ran continuously across that span; no non-working time was
+    //       inserted, so wall-clock math is exact.
+    //   planned_end_time − start_time  >   duration
+    //     → the SLA engine pushed the deadline out to skip non-working time. The
+    //       clock pauses, and CONFIG.SCHEDULE is our model of when.
+    //
+    // Tolerance is a minute: the engine's own timestamps can disagree by a second
+    // or two, while a real schedule gap is never smaller than the break it skips.
+    //
+    // If duration doesn't parse, fall back to the definition's schedule reference —
+    // no schedule means no pauses. That reference is only trustworthy when the
+    // schedule comes from the definition; schedule_source of 'task' means it's read
+    // off a task field this query never sees, so an empty sla.schedule proves
+    // nothing and we keep the (conservative) schedule-aware reading.
+    const SCHEDULE_GAP_TOLERANCE_MS = 60 * 1000;
+    function clockPauses(row) {
+        const s = parseSnowUtc(row.start);
+        const e = parseSnowUtc(row.plannedEnd);
+        if (s == null || e == null || e <= s) return null;
+
+        const durationMs = parseSnowDuration(row.slaDuration);
+        if (durationMs != null) return (e - s) > durationMs + SCHEDULE_GAP_TOLERANCE_MS;
+
+        const fromDefinition = !row.scheduleSource || row.scheduleSource === 'sla_definition';
+        return !(fromDefinition && !row.slaSchedule);
+    }
+
     // Percentage is derived here rather than read from task_sla.percentage because
     // that field is a snapshot written by the SLA engine on task update and by a
     // scheduled job — it can lag by minutes. Against a 60-minute OLA a few minutes
@@ -483,13 +560,15 @@
     // a threshold entirely. planned_end_time is a fixed timestamp, so the live
     // number can be computed exactly.
     //
-    // Schedule-aware: both the total window and the elapsed time are measured in
-    // business milliseconds (FR M-F 08:00–19:00 Europe/Paris, excluding French
-    // holidays) via businessMsBetween, not raw wall-clock ms. Plain wall-clock
-    // division would read a ticket opened 18:50 against a 19:00 close as already
-    // most of the way consumed, when almost none of its actual business window
-    // has passed. nowMs is a parameter (defaulting to Date.now()) purely so the
-    // self-test below can pin it rather than racing real time.
+    // Measured in whichever time base this row's clock actually runs on, per
+    // clockPauses(). For an OLA that pauses, both the total window and the elapsed
+    // time are business milliseconds (CONFIG.SCHEDULE) via businessMsBetween:
+    // wall-clock division would read a ticket opened 18:50 on Friday against a
+    // Monday deadline as barely started when its whole window is nearly spent. For
+    // an OLA that doesn't pause, it is plain wall-clock division, because business
+    // math on a clock that never stops is what inflated the percentage of anything
+    // opened near the 19:00 close. nowMs is a parameter (defaulting to Date.now())
+    // purely so the self-test below can pin it rather than racing real time.
     function computePct(row, nowMs = Date.now()) {
         const s = parseSnowUtc(row.start);
         const e = parseSnowUtc(row.plannedEnd);
@@ -504,6 +583,13 @@
         // nothing here checking it against anything before showing it. Returning
         // null instead just excludes the row until the next poll (≤30s) resolves it.
         if (s == null || e == null || e <= s) return null;
+
+        // A clock that never stops: elapsed and total are the same wall-clock span
+        // the SLA engine itself used to place planned_end_time.
+        if (clockPauses(row) === false) {
+            return clampPct(((Math.min(nowMs, e) - s) / (e - s)) * 100);
+        }
+
         const totalBusinessMs = businessMsBetween(s, e);
         // Zero business hours in the window (e.g. entirely inside a holiday) is a
         // real, stable state rather than a transient gap — serverPct is the only
@@ -511,13 +597,27 @@
         // would ever produce a better answer.
         if (totalBusinessMs <= 0) return row.serverPct || null;
         const elapsedBusinessMs = businessMsBetween(s, Math.min(nowMs, e));
-        const pct = (elapsedBusinessMs / totalBusinessMs) * 100;
+        return clampPct((elapsedBusinessMs / totalBusinessMs) * 100);
+    }
+
+    function clampPct(pct) {
         return Math.min(100, Math.max(0, pct));
     }
 
-    function msRemaining(row) {
+    // Counted on the same time base as computePct, deliberately. These two numbers
+    // sit next to each other on every row, so measuring them differently makes the
+    // panel contradict itself: the percentage said an OLA was three-quarters gone
+    // while the countdown beside it read 39 minutes, because one was schedule-aware
+    // and the other was raw subtraction. For a paused clock the answer is the
+    // business time left, which is also why the countdown correctly stops moving
+    // overnight instead of draining through hours nobody is working.
+    function msRemaining(row, nowMs = Date.now()) {
         const e = parseSnowUtc(row.plannedEnd);
-        return e == null ? null : e - Date.now();
+        if (e == null) return null;
+        // Past the deadline the overshoot is real elapsed time either way, and a
+        // negative value is what fmtRemaining reads as BREACHED.
+        if (nowMs >= e) return e - nowMs;
+        return clockPauses(row) ? businessMsBetween(nowMs, e) : e - nowMs;
     }
 
     // Business-time-aware OLAs routinely have hours (or, spanning a weekend,
@@ -1342,12 +1442,45 @@
             return names;
         },
 
+        // Why is THAT ticket showing THAT number? Prints the inputs behind every
+        // row's percentage and countdown — including which time base clockPauses()
+        // picked and why — so a disagreement with ServiceNow's own percentage can
+        // be read off directly instead of inferred. `span` and `duration` being
+        // equal is what makes a row continuous; a `span` much larger than
+        // `duration` is the engine having skipped non-working time.
+        async explain() {
+            const rows = await fetchOlaRows(await resolveGroupSysId());
+            const mins = ms => (ms == null ? '—' : (ms / 60000).toFixed(0) + 'm');
+            const table = rows.map(r => {
+                const s = parseSnowUtc(r.start), e = parseSnowUtc(r.plannedEnd);
+                const pauses = clockPauses(r);
+                const pct = computePct(r);
+                return {
+                    ticket: r.number,
+                    start: r.start,
+                    plannedEnd: r.plannedEnd,
+                    span: s != null && e != null ? mins(e - s) : '—',
+                    duration: mins(parseSnowDuration(r.slaDuration)),
+                    schedule: r.slaSchedule ? (r.scheduleSource || 'sla_definition') : '(none)',
+                    clock: pauses == null ? 'unknown' : (pauses ? 'pauses' : 'continuous'),
+                    pct: pct == null ? '—' : pct.toFixed(1) + '%',
+                    serverPct: r.serverPct + '%',
+                    left: fmtRemaining(msRemaining(r))
+                };
+            });
+            console.table(table);
+            return table;
+        },
+
         // Pure-logic self-check: the clock maths and threshold bookkeeping are the
         // parts that silently do the wrong thing, and they're the parts a live
         // instance can't easily be made to demonstrate on demand.
         selfTest() {
             const fails = [];
-            const check = (name, cond) => { if (!cond) fails.push(name); };
+            let ran = 0;
+            // Counted rather than hard-coded in the "passed (N checks)" line below,
+            // which otherwise silently goes stale every time a check is added.
+            const check = (name, cond) => { ran++; if (!cond) fails.push(name); };
 
             const iso = ms => new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
             // Fixed calendar points, not "now minus N" — computePct is schedule-aware,
@@ -1357,11 +1490,16 @@
             // on what day the suite happens to run.
             const pIso = (y, m, d, hh, mi) => iso(parisLocalToUtc(y, m, d, hh, mi));
             const pMs  = (y, m, d, hh, mi) => parisLocalToUtc(y, m, d, hh, mi);
-            const row = (startIso, endIso) => ({ start: startIso, plannedEnd: endIso, serverPct: 0 });
+            // Rows carry whichever of the clockPauses() signals the case is about.
+            // PAUSING marks an OLA whose definition has a schedule (so the clock
+            // stops outside it); a `slaDuration` matching the row's own span marks
+            // one that runs continuously.
+            const PAUSING = { slaSchedule: 'e'.repeat(32) };
+            const row = (startIso, endIso, extra) => ({ start: startIso, plannedEnd: endIso, serverPct: 0, ...extra });
 
             // Tue 2026-08-04, a plain business day: 10:00–11:00 Paris is a 60
             // business-minute OLA entirely inside the 08:00–19:00 window.
-            const sameDay = row(pIso(2026, 8, 4, 10, 0), pIso(2026, 8, 4, 11, 0));
+            const sameDay = row(pIso(2026, 8, 4, 10, 0), pIso(2026, 8, 4, 11, 0), PAUSING);
             check('50% midpoint', Math.abs(computePct(sameDay, pMs(2026, 8, 4, 10, 30)) - 50) < 0.5);
             check('75% point', Math.abs(computePct(sameDay, pMs(2026, 8, 4, 10, 45)) - 75) < 0.5);
             // Past the deadline clamps to 100, never above
@@ -1373,7 +1511,7 @@
             // hour left in Friday's window + 2 business hours Monday morning = 3h
             // total. This is the case wall-clock division gets wrong — the window
             // spans a weekend, so most of its raw duration is non-business time.
-            const spansWeekend = row(pIso(2026, 8, 7, 18, 0), pIso(2026, 8, 10, 10, 0));
+            const spansWeekend = row(pIso(2026, 8, 7, 18, 0), pIso(2026, 8, 10, 10, 0), PAUSING);
             const atFridayClose = computePct(spansWeekend, pMs(2026, 8, 7, 19, 0)); // Friday's window has just closed: 1 of 3 business hours spent
             check('schedule-aware, not wall-clock (Friday close = 1/3)', Math.abs(atFridayClose - (100 / 3)) < 0.5);
             const midWeekend = computePct(spansWeekend, pMs(2026, 8, 8, 12, 0)); // Saturday afternoon: no business hours have passed since Friday close
@@ -1382,7 +1520,7 @@
             // Bastille Day 2026-07-14 (Tuesday) is a French holiday: an OLA window
             // entirely inside it has zero business hours, so computePct falls back
             // to serverPct rather than dividing by zero.
-            const onHoliday = { start: pIso(2026, 7, 14, 8, 0), plannedEnd: pIso(2026, 7, 14, 19, 0), serverPct: 42 };
+            const onHoliday = row(pIso(2026, 7, 14, 8, 0), pIso(2026, 7, 14, 19, 0), { ...PAUSING, serverPct: 42 });
             check('holiday window falls back to serverPct', computePct(onHoliday, pMs(2026, 7, 14, 12, 0)) === 42);
 
             // A row with a missing/unparseable start_time (the just-created-ticket
@@ -1393,6 +1531,58 @@
             check('missing start_time does not trust serverPct', computePct(missingStart, pMs(2026, 8, 4, 10, 1)) === null);
             const missingEnd = { start: pIso(2026, 8, 4, 10, 0), plannedEnd: '', serverPct: 80 };
             check('missing planned_end_time does not trust serverPct', computePct(missingEnd, pMs(2026, 8, 4, 10, 1)) === null);
+
+            // ── The 18:32 ticket ────────────────────────────────────────────────
+            // The case this whole branch exists for, with its real numbers: a
+            // 1-hour OLA opened at 18:32 on a business day, deadline 19:32 — a
+            // wall-clock hour later, so the SLA engine inserted no non-working
+            // time and this clock plainly does not pause at 19:00. 21 minutes in
+            // it is 35% consumed, not 75%: applying CONFIG.SCHEDULE to it counted
+            // only the 28 minutes before the close as its window (21/28), which
+            // both crossed CRIT_AT and fired the 75% notification on a ticket
+            // with 39 minutes still on the clock.
+            const HOUR = 60 * 60 * 1000;
+            const continuous = row(pIso(2026, 8, 4, 18, 32), pIso(2026, 8, 4, 19, 32), { slaDuration: '1970-01-01 01:00:00' });
+            const at1853 = pMs(2026, 8, 4, 18, 53);
+            check('24/7 OLA across the close reads 35%', Math.abs(computePct(continuous, at1853) - 35) < 0.5);
+            check('24/7 OLA across the close is not critical', computePct(continuous, at1853) < CONFIG.CRIT_AT);
+            check('24/7 OLA across the close does not notify', crossedThreshold(computePct(continuous, at1853)) === null);
+            // Same row, the countdown: 39 minutes, and now agreeing with the 35%
+            // beside it rather than contradicting it.
+            check('24/7 countdown is wall-clock', Math.abs(msRemaining(continuous, at1853) - 39 * 60 * 1000) < 1000);
+
+            // A pausing OLA's countdown is business time, not the raw gap: Friday
+            // 19:00 with a Monday 10:00 deadline has 2 working hours left, not the
+            // 63 wall-clock hours the old subtraction reported.
+            check('pausing countdown is business time', Math.abs(msRemaining(spansWeekend, pMs(2026, 8, 7, 19, 0)) - 2 * HOUR) < 1000);
+            check('breached countdown goes negative', msRemaining(sameDay, pMs(2026, 8, 4, 11, 30)) < 0);
+
+            // ── clockPauses signals ─────────────────────────────────────────────
+            // Span equal to the definition's duration → the clock ran straight
+            // through; span longer → the engine skipped non-working time.
+            check('span == duration → continuous', clockPauses(continuous) === false);
+            check('span > duration → pauses', clockPauses(row(pIso(2026, 8, 4, 18, 32), pIso(2026, 8, 5, 8, 32), { slaDuration: '1970-01-01 01:00:00' })) === true);
+            // Duration wins over the schedule reference — a definition can carry a
+            // schedule that inserted no gap into THIS row's window.
+            check('duration outranks schedule ref', clockPauses({ ...continuous, ...PAUSING }) === false);
+            // Fallback when duration is unreadable: no schedule means no pauses,
+            // but a schedule that comes from the task is invisible here, so an
+            // empty sla.schedule proves nothing and the schedule-aware reading stands.
+            const noDuration = (extra) => clockPauses(row(pIso(2026, 8, 4, 18, 32), pIso(2026, 8, 4, 19, 32), extra));
+            check('no duration, no schedule → continuous', noDuration({}) === false);
+            check('no duration, definition schedule → pauses', noDuration(PAUSING) === true);
+            check('no duration, task-sourced schedule → pauses', noDuration({ scheduleSource: 'task' }) === true);
+            check('unparseable timestamps → unknown', clockPauses({ start: '', plannedEnd: '' }) === null);
+
+            // glide_duration is an offset from the epoch, in either the datetime
+            // form the Table API returns or the bare clock form some instances do.
+            check('duration 1h', parseSnowDuration('1970-01-01 01:00:00') === HOUR);
+            check('duration 27h', parseSnowDuration('1970-01-02 03:00:00') === 27 * HOUR);
+            check('duration bare clock', parseSnowDuration('01:00:00') === HOUR);
+            check('duration days form', parseSnowDuration('1 day 02:00:00') === 26 * HOUR);
+            check('duration empty', parseSnowDuration('') === null);
+            check('duration zero', parseSnowDuration('1970-01-01 00:00:00') === null);
+            check('duration junk', parseSnowDuration('not a duration') === null);
 
             // Threshold selection returns the MOST severe NOTIFY_AT point crossed,
             // not the first. NOTIFY_AT is [75] by default.
@@ -1422,7 +1612,7 @@
                 console.error('[OLA Watch] selfTest FAILED:', fails);
                 return { ok: false, fails };
             }
-            console.log('[OLA Watch] selfTest passed (20 checks)');
+            console.log(`[OLA Watch] selfTest passed (${ran} checks)`);
             return { ok: true };
         }
     };
