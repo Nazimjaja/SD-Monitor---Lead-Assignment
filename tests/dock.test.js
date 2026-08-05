@@ -196,6 +196,54 @@ async function run() {
         r.check('corner ribbon is still visible', bareState.visible, `at ${Math.round(bareState.left)},${Math.round(bareState.top)}`);
         await bare.close();
 
+        // The real instance nests the header several open shadow roots deep. Two
+        // things break there and nowhere else: the document stylesheet does not
+        // reach the ribbon (unstyled, no size, rejected by its own verification),
+        // and offsetParent returns null across a shadow boundary, so the
+        // coordinate origin for the tabs' inline `left` has to come from a tab.
+        const shadow = await startSnowPage(browser, { script: 'watch', handler, viewport: VIEW });
+        await shadow.evaluate(({ style, header }) => {
+            // host > #shadow-root > host > #shadow-root > host > #shadow-root > nav
+            let parent = document.body;
+            for (let i = 0; i < 3; i++) {
+                const host = document.createElement(`sn-layer-${i}`);
+                parent.appendChild(host);
+                parent = host.attachShadow({ mode: 'open' });
+            }
+            parent.innerHTML = style + header;
+        }, { style: STYLE, header: POLARIS_HEADER });
+        await shadow.waitForTimeout(2000);
+        const deep = await shadow.evaluate(() => {
+            const status = window.__olaWatchDebug.panelStatus();
+            // Walk back down to the nav to measure it in its own root.
+            let root = document;
+            for (let i = 0; i < 3; i++) root = root.querySelector(`sn-layer-${i}`).shadowRoot;
+            const host = root.querySelector('.polaris-header-menu');
+            const rib = root.getElementById('olaRibbon');
+            const box = n => { const r = n.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height }; };
+            return {
+                status,
+                foundInShadow: !!rib,
+                ribbonParentIsNav: !!rib && rib.parentElement === host,
+                ribbon: rib ? box(rib) : null,
+                tabs: [...host.querySelectorAll('.sn-polaris-tab')].filter(t => t.id !== 'olaRibbon').map(t => ({ label: t.getAttribute('aria-label'), ...box(t) }))
+            };
+        });
+        r.check('docks through nested shadow roots', deep.status.mode === 'docked', deep.status.dock);
+        r.check('ribbon is inside the shadow nav', deep.foundInShadow && deep.ribbonParentIsNav);
+        r.check('ribbon is styled inside the shadow root',
+            !!deep.ribbon && deep.ribbon.height >= 20 && deep.ribbon.width > 40,
+            deep.ribbon ? `${Math.round(deep.ribbon.width)}x${Math.round(deep.ribbon.height)}` : 'no rect');
+        const deepHit = deep.tabs.filter(t => t.width > 0 && overlaps(deep.ribbon, t));
+        r.check('no overlap inside the shadow root', deepHit.length === 0, deepHit.map(t => t.label).join(', ') || 'clear of all 4');
+        r.check('placed after the last shadow tab',
+            deep.ribbon.left >= Math.max(...deep.tabs.filter(t => t.width > 0).map(t => t.right)),
+            `${Math.round(deep.ribbon.left)}`);
+        r.check('lines up with the shadow tab row',
+            Math.abs(deep.ribbon.top - deep.tabs.find(t => t.label === 'Favorites').top) <= 1);
+        await shadow.screenshot({ path: path.join(SHOT_DIR, 'dock-shadow.png'), clip: { x: 0, y: 0, width: VIEW.width, height: 60 } });
+        await shadow.close();
+
         // A nav that exists but can't hold the ribbon (zero-size container) must
         // be rejected by verification rather than leaving an invisible ribbon.
         const hidden = await startSnowPage(browser, {
