@@ -21,7 +21,7 @@ const snow = ms => new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
 
 // elapsed/total are what the row should read as; the record is built backwards
 // from "now" so the assertions don't depend on when the suite runs.
-function olaRecord({ id, number, table, name, duration, elapsed, total, assignee = '' }) {
+function olaRecord({ id, number, table, name, duration, elapsed, total, paused = 0, assignee = '' }) {
     const now = Date.now();
     return {
         sys_id: { value: id }, stage: { value: 'in_progress' },
@@ -30,6 +30,7 @@ function olaRecord({ id, number, table, name, duration, elapsed, total, assignee
         percentage: { value: '1' }, has_breached: { value: 'false' },
         start_time: { value: snow(now - elapsed) },
         planned_end_time: { value: snow(now - elapsed + total) },
+        pause_duration: { value: paused ? snow(paused) : '' },
         'sla.name': { display_value: name, value: name },
         'sla.duration': { value: duration },
         'sla.schedule': { value: '' }, 'sla.schedule_source': { value: '' },
@@ -51,7 +52,16 @@ const RECORDS = [
     // 4-hour OLA only 45 minutes in: 18.75%, below SHOW_AT. Read against a
     // 1-hour window it would be 75% and on screen — this is the regression row.
     olaRecord({ id: 'C', number: 'CTASK0044982', table: 'sc_task', name: 'CTSK-RES-CORP-SD',
-        duration: '1970-01-01 04:00:00', elapsed: 45 * MIN, total: 4 * HOUR })
+        duration: '1970-01-01 04:00:00', elapsed: 45 * MIN, total: 4 * HOUR }),
+    // A 1-hour OLA that spent most of its life parked: opened four hours ago, held
+    // for 3h51 of that, and resumed with 51 minutes still on the clock — so nine
+    // minutes of it have actually been spent and it belongs nowhere near the panel.
+    // `elapsed` here is wall clock since start_time, which is exactly the number
+    // that must NOT be read as consumed: measured that way it is 4 hours of a
+    // 1-hour OLA, and this row shows up in the red band with 51 minutes left.
+    olaRecord({ id: 'D', number: 'INC2105487', table: 'incident', name: 'INC-RES-CORP-SD',
+        duration: '1970-01-01 01:00:00', elapsed: 4 * HOUR, total: 4 * HOUR + 51 * MIN,
+        paused: 3 * HOUR + 51 * MIN })
 ];
 
 async function run() {
@@ -110,6 +120,13 @@ async function run() {
         r.check('the young 4-hour OLA is not on screen',
             !rows.some(x => x.number === 'CTASK0044982'),
             'CTASK0044982 is 18.75% consumed, below SHOW_AT');
+
+        // Counted forward from start_time this one is 400% consumed. Counted back
+        // from the deadline the engine moved for it, it is 15% — which is what the
+        // ticket that started this actually looked like on ServiceNow's own form.
+        r.check('a resumed OLA is judged on time run, not time since it started',
+            !rows.some(x => x.number === 'INC2105487'),
+            'INC2105487 was paused 3h51 of its 4h life — 9 minutes spent, below SHOW_AT');
 
         // Mixed clocks need the name somewhere, and the row is the only place.
         r.check('rows name their OLA', ctask && /CTSK-RES-CORP-SD/.test(ctask.title), ctask && JSON.stringify(ctask.title));

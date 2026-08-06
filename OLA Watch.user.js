@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SD Monitor - OLA Breach Warning
 // @namespace    geodis-sd-monitor
-// @version      0.14
+// @version      0.15
 // @description  Warns every SD agent when a group ticket's resolution OLA crosses 75%, and lets whoever is free take it over on the spot
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
@@ -325,14 +325,19 @@
     // class, assignee and description, instead of a second round trip per ticket.
     const OLA_FIELDS = [
         'sys_id', 'stage', 'percentage', 'has_breached', 'start_time', 'planned_end_time',
+        // Total time this clock has spent parked. A resumed SLA's planned_end_time
+        // has been pushed out by everything it sat paused for, which otherwise
+        // reads exactly like a schedule gap to clockPauses() below.
+        'pause_duration',
         'sla.name',
         // The three fields clockPauses() needs to decide whether this OLA's clock
         // runs continuously or pauses outside a schedule. `sla.duration` is the
-        // primary signal (compared against the row's own start→planned_end span);
-        // `sla.schedule` / `sla.schedule_source` are the fallback for a definition
-        // whose duration doesn't parse. An instance that doesn't have
-        // schedule_source simply omits it from the response — fieldVal returns ''
-        // and the fallback still works off the schedule reference alone.
+        // primary signal (compared against the row's own start→planned_end span,
+        // less whatever `pause_duration` says the row spent parked); `sla.schedule`
+        // / `sla.schedule_source` are the fallback for a definition whose duration
+        // doesn't parse. An instance that doesn't have schedule_source simply omits
+        // it from the response — fieldVal returns '' and the fallback still works
+        // off the schedule reference alone.
         'sla.duration', 'sla.schedule', 'sla.schedule_source',
         'task.sys_id', 'task.number', 'task.sys_class_name',
         'task.short_description', 'task.assigned_to', 'task.priority'
@@ -388,6 +393,7 @@
             hasBreached: String(fieldVal(rec, 'has_breached')) === 'true',
             start:       fieldVal(rec, 'start_time'),
             plannedEnd:  fieldVal(rec, 'planned_end_time'),
+            pauseDuration: fieldVal(rec, 'pause_duration'),
             // Which OLA this row is, now that more than one is watched — the panel
             // mixes them, so "why is that row at 80%?" needs the name to answer.
             slaName:     fieldDisplay(rec, 'sla.name'),
@@ -590,6 +596,14 @@
     // Tolerance is a minute: the engine's own timestamps can disagree by a second
     // or two, while a real schedule gap is never smaller than the break it skips.
     //
+    // A schedule gap is not the only thing that stretches that span, though. Every
+    // minute an SLA spends paused also pushes planned_end_time out, so a 24/7 OLA
+    // that was parked on "awaiting user info" for three hours has a span three
+    // hours longer than its duration through no fault of any schedule. pause_duration
+    // is subtracted first for exactly that reason — otherwise a resumed continuous
+    // OLA gets read as schedule-aware and its countdown drains only during office
+    // hours.
+    //
     // If duration doesn't parse, fall back to the definition's schedule reference —
     // no schedule means no pauses. That reference is only trustworthy when the
     // schedule comes from the definition; schedule_source of 'task' means it's read
@@ -602,7 +616,10 @@
         if (s == null || e == null || e <= s) return null;
 
         const durationMs = parseSnowDuration(row.slaDuration);
-        if (durationMs != null) return (e - s) > durationMs + SCHEDULE_GAP_TOLERANCE_MS;
+        if (durationMs != null) {
+            const pausedMs = parseSnowDuration(row.pauseDuration) || 0;
+            return (e - s - pausedMs) > durationMs + SCHEDULE_GAP_TOLERANCE_MS;
+        }
 
         const fromDefinition = !row.scheduleSource || row.scheduleSource === 'sla_definition';
         return !(fromDefinition && !row.slaSchedule);
@@ -615,15 +632,39 @@
     // a threshold entirely. planned_end_time is a fixed timestamp, so the live
     // number can be computed exactly.
     //
-    // Measured in whichever time base this row's clock actually runs on, per
-    // clockPauses(). For an OLA that pauses, both the total window and the elapsed
-    // time are business milliseconds (CONFIG.SCHEDULE) via businessMsBetween:
-    // wall-clock division would read a ticket opened 18:50 on Friday against a
-    // Monday deadline as barely started when its whole window is nearly spent. For
-    // an OLA that doesn't pause, it is plain wall-clock division, because business
-    // math on a clock that never stops is what inflated the percentage of anything
-    // opened near the 19:00 close. nowMs is a parameter (defaulting to Date.now())
-    // purely so the self-test below can pin it rather than racing real time.
+    // Measured against the OLA's own duration — the business-time budget the SLA
+    // definition grants it — and NOT against the row's start→planned_end span.
+    // Those two look interchangeable and are not: planned_end_time is a moving
+    // target the engine pushes forward for every minute the clock spends paused,
+    // so the span is "the budget plus all the non-working time and all the parked
+    // time", while the duration is just the budget.
+    //
+    // Dividing by the span is what put SCTASK1470081 in the red band at 54% with
+    // 3h50 still on its four-hour clock: it started 11:59, sat paused from 12:06
+    // to 16:33, and resumed with planned_end pushed out to 09:26 the next morning.
+    // Measured span-wise that is 4h36 elapsed out of an 8h27 window — every paused
+    // hour counted as consumed, twice over, once by inflating the numerator and
+    // again by inflating the denominator. ServiceNow's own form said 3%.
+    //
+    // Elapsed is therefore derived as `duration − msRemaining()` rather than
+    // counted forward from start_time. Counting forward is what cannot tell a
+    // paused hour from a spent one; counting back from planned_end_time inherits
+    // the engine's own bookkeeping for free, because that timestamp already has
+    // every pause and every schedule gap folded into it. It also makes the
+    // percentage and the countdown beside it two views of one number, so they can
+    // no longer disagree.
+    //
+    // msRemaining() is where the time base still matters, per clockPauses(): for an
+    // OLA that pauses, the remainder is business milliseconds (CONFIG.SCHEDULE) via
+    // businessMsBetween, because wall-clock subtraction would read a ticket opened
+    // 18:50 Friday against a Monday deadline as having the whole weekend in hand;
+    // for one that doesn't pause it is plain subtraction, because business math on a
+    // clock that never stops is what inflated the percentage of anything opened near
+    // the 19:00 close.
+    //
+    // Only when duration is unreadable does the old span-based reading stand in.
+    // nowMs is a parameter (defaulting to Date.now()) purely so the self-test below
+    // can pin it rather than racing real time.
     function computePct(row, nowMs = Date.now()) {
         const s = parseSnowUtc(row.start);
         const e = parseSnowUtc(row.plannedEnd);
@@ -638,6 +679,19 @@
         // nothing here checking it against anything before showing it. Returning
         // null instead just excludes the row until the next poll (≤30s) resolves it.
         if (s == null || e == null || e <= s) return null;
+
+        const durationMs = parseSnowDuration(row.slaDuration);
+        if (durationMs != null) {
+            const leftMs = msRemaining(row, nowMs);
+            // A remainder of exactly zero while the deadline is still in the future
+            // means CONFIG.SCHEDULE found no working time between now and a moment
+            // the engine plainly considers reachable — our model of the schedule is
+            // wrong for this row, not the row. Fall through rather than report a
+            // ticket with hours left as 100% consumed.
+            if (leftMs != null && !(leftMs === 0 && nowMs < e)) {
+                return clampPct(((durationMs - leftMs) / durationMs) * 100);
+            }
+        }
 
         // A clock that never stops: elapsed and total are the same wall-clock span
         // the SLA engine itself used to place planned_end_time.
@@ -2007,9 +2061,11 @@
         // Why is THAT ticket showing THAT number? Prints the inputs behind every
         // row's percentage and countdown — including which time base clockPauses()
         // picked and why — so a disagreement with ServiceNow's own percentage can
-        // be read off directly instead of inferred. `span` and `duration` being
-        // equal is what makes a row continuous; a `span` much larger than
-        // `duration` is the engine having skipped non-working time.
+        // be read off directly instead of inferred. `span` minus `paused` equal to
+        // `duration` is what makes a row continuous; much larger than `duration` is
+        // the engine having skipped non-working time. `basis` says whether the
+        // percentage came from the duration budget (`duration − left`, the normal
+        // case) or from the span fallback used when duration won't parse.
         async explain() {
             const rows = await fetchOlaRows(await resolveGroupSysId());
             const mins = ms => (ms == null ? '—' : (ms / 60000).toFixed(0) + 'm');
@@ -2017,15 +2073,18 @@
                 const s = parseSnowUtc(r.start), e = parseSnowUtc(r.plannedEnd);
                 const pauses = clockPauses(r);
                 const pct = computePct(r);
+                const durationMs = parseSnowDuration(r.slaDuration);
                 return {
                     ticket: r.number,
                     ola: r.slaName,
                     start: r.start,
                     plannedEnd: r.plannedEnd,
                     span: s != null && e != null ? mins(e - s) : '—',
-                    duration: mins(parseSnowDuration(r.slaDuration)),
+                    paused: mins(parseSnowDuration(r.pauseDuration) || 0),
+                    duration: mins(durationMs),
                     schedule: r.slaSchedule ? (r.scheduleSource || 'sla_definition') : '(none)',
                     clock: pauses == null ? 'unknown' : (pauses ? 'pauses' : 'continuous'),
+                    basis: durationMs != null ? 'duration' : 'span',
                     pct: pct == null ? '—' : pct.toFixed(1) + '%',
                     serverPct: r.serverPct + '%',
                     left: fmtRemaining(msRemaining(r))
@@ -2177,6 +2236,58 @@
             // A 4-hour window opened at 09:00 fits inside the 08:00–19:00 day, so
             // its clock plainly ran straight through — same test as the 1-hour one.
             check('4h OLA span == duration → continuous', clockPauses(fourHour) === false);
+
+            // ── SCTASK1470081: the paused-then-resumed ticket ───────────────────
+            // The real numbers off the ticket that showed "Breaching soon" with
+            // 3h50 left on a four-hour clock. It started Thursday 12:00, was parked
+            // on hold from 12:07 to 16:33 (4h26 of wall clock), and came back with
+            // the engine having pushed planned_end out to 09:26 Friday morning to
+            // give it back the 3h53 of budget it still had.
+            //
+            // Seven minutes of that OLA had actually been spent. Measuring elapsed
+            // forward from start_time against the start→planned_end span read it as
+            // 4h35 of an 8h26 window — 54%, past CRIT_AT, on a ticket ServiceNow's
+            // own form was showing at 3%. Counting back from planned_end against
+            // the 4-hour duration gets the paused hours right because the engine
+            // already accounted for them when it moved that deadline.
+            const resumed = row(pIso(2026, 8, 6, 12, 0), pIso(2026, 8, 7, 9, 26), {
+                ...PAUSING,
+                slaDuration: '1970-01-01 04:00:00',
+                pauseDuration: '1970-01-01 04:26:00'
+            });
+            const at1635 = pMs(2026, 8, 6, 16, 35);
+            // 4h budget, 3h51 of business time left → 9 minutes spent.
+            check('resumed OLA reads ~4%, not 54%', Math.abs(computePct(resumed, at1635) - 3.75) < 0.5);
+            check('resumed OLA is not critical', computePct(resumed, at1635) < CONFIG.CRIT_AT);
+            check('resumed OLA is not even worth showing', computePct(resumed, at1635) < CONFIG.SHOW_AT);
+            check('resumed OLA does not notify', crossedThreshold(computePct(resumed, at1635)) === null);
+            // The countdown was never the part that was wrong — planned_end_time is
+            // trustworthy, which is exactly why the percentage now leans on it.
+            check('resumed countdown is 3h51 of business time',
+                Math.abs(msRemaining(resumed, at1635) - (3 * HOUR + 51 * 60 * 1000)) < 1000);
+            // Pause time still stretches the span past the duration, so this clock
+            // is correctly read as schedule-aware — it just no longer sets the scale.
+            check('resumed OLA still pauses on the schedule', clockPauses(resumed) === true);
+            // And the reading it replaced, pinned so the regression is a number:
+            // strip the duration and the same row falls back to the span and lands
+            // back in the red band.
+            check('span-based reading of the same row was 54%',
+                Math.abs(computePct({ ...resumed, slaDuration: '' }, at1635) - 54.3) < 0.5);
+
+            // pause_duration also keeps a 24/7 OLA from being mistaken for a
+            // scheduled one after a hold: 1-hour OLA opened 18:32, parked 3 hours,
+            // deadline pushed to 22:32. The span is four times the duration, but
+            // three of those hours are the hold, not the 19:00 close — subtract
+            // them and it is plainly the continuous clock it always was.
+            const heldContinuous = row(pIso(2026, 8, 4, 18, 32), pIso(2026, 8, 4, 22, 32), {
+                slaDuration: '1970-01-01 01:00:00',
+                pauseDuration: '1970-01-01 03:00:00'
+            });
+            check('pause time is not a schedule gap', clockPauses(heldContinuous) === false);
+            check('held 24/7 OLA counts only the minutes it ran',
+                Math.abs(computePct(heldContinuous, pMs(2026, 8, 4, 21, 45)) - (13 / 60) * 100) < 0.5);
+            check('without pause_duration the same row looks scheduled',
+                clockPauses({ ...heldContinuous, pauseDuration: '' }) === true);
 
             // ── Ribbon placement ────────────────────────────────────────────────
             // firstFreeX is the whole no-overlap rule: the ribbon goes after the
