@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SD Monitor - OLA Breach Warning
 // @namespace    geodis-sd-monitor
-// @version      0.13
+// @version      0.14
 // @description  Warns every SD agent when a group ticket's resolution OLA crosses 75%, and lets whoever is free take it over on the spot
 // @homepageURL  https://github.com/Nazimjaja/SD-Monitor---Lead-Assignment
 // @updateURL    https://raw.githubusercontent.com/Nazimjaja/SD-Monitor---Lead-Assignment/main/OLA%20Watch.user.js
@@ -37,12 +37,20 @@
     const CONFIG = {
         ASSIGNMENT_GROUP: 'CORP-SD',
 
-        // The OLA definition name in contract_sla. A task carries several SLA/OLA/UC
-        // instances at once (response, resolution, underpinning contracts), so this
-        // name is what narrows task_sla down to the single clock we care about.
-        // If the panel reports 0 rows on a ticket you know is running, this string is
+        // The OLA definition names in contract_sla. A task carries several SLA/OLA/UC
+        // instances at once (response, resolution, underpinning contracts), so these
+        // names are what narrow task_sla down to the clocks we care about.
+        // If the panel reports 0 rows on a ticket you know is running, this list is
         // the first thing to check — see __olaWatchDebug.listSlaNames().
-        OLA_NAME: 'INC-RES-CORP-SD',
+        //
+        // Nothing here needs to know how long any of them runs for. The two in this
+        // list have different lifetimes — INC-RES 1 hour, CTSK-RES 4 — and the
+        // percentage is derived per row from that row's own start_time /
+        // planned_end_time / sla.duration, so a third with a different duration
+        // again would need nothing beyond its name. The one thing a list DOES
+        // share is the threshold set below: 75% is 15 minutes' warning on the
+        // 1-hour OLA and a full hour on the 4-hour one.
+        OLA_NAMES: ['INC-RES-CORP-SD', 'CTSK-RES-CORP-SD'],
 
         // The business schedule to assume for OLAs whose clock actually pauses:
         // (Geo) FR, Mon–Fri 08:00–19:00, Europe/Paris (CET/CEST — handled below via
@@ -345,9 +353,19 @@
         return typeof f === 'object' ? (f.display_value ?? f.value ?? '') : f;
     }
 
+    // The name clause of the encoded query. `IN` is the multi-value operator (the
+    // same one STAGE_FILTER documents for stages); a single configured name stays
+    // on `=` so a one-OLA setup produces exactly the query it always did. Kept
+    // separate from the fetch so the self-test can check it without a network.
+    function olaNameClause(names) {
+        const list = (names || []).filter(Boolean);
+        if (!list.length) throw new Error('CONFIG.OLA_NAMES is empty — there is nothing to watch.');
+        return list.length === 1 ? `sla.name=${list[0]}` : `sla.nameIN${list.join(',')}`;
+    }
+
     async function fetchOlaRows(gid) {
         const query = [
-            `sla.name=${CONFIG.OLA_NAME}`,
+            olaNameClause(CONFIG.OLA_NAMES),
             'active=true',
             CONFIG.STAGE_FILTER,
             `task.assignment_group=${gid}`
@@ -370,6 +388,9 @@
             hasBreached: String(fieldVal(rec, 'has_breached')) === 'true',
             start:       fieldVal(rec, 'start_time'),
             plannedEnd:  fieldVal(rec, 'planned_end_time'),
+            // Which OLA this row is, now that more than one is watched — the panel
+            // mixes them, so "why is that row at 80%?" needs the name to answer.
+            slaName:     fieldDisplay(rec, 'sla.name'),
             slaDuration: fieldVal(rec, 'sla.duration'),
             slaSchedule: fieldVal(rec, 'sla.schedule'),
             scheduleSource: fieldVal(rec, 'sla.schedule_source'),
@@ -1616,8 +1637,10 @@
         function addRow(row, cls) {
             const rowEl = el('div', 'olaRow');
             rowEl.dataset.sla = row.slaSysId;
-            rowEl.title = row.shortDesc || '';   // description no longer has a line of
-                                                 // its own; the row is 61px because of it
+            // Description no longer has a line of its own; the row is 61px because
+            // of it. The OLA name rides along because the panel now mixes clocks of
+            // different lengths, and "which one is this" isn't visible otherwise.
+            rowEl.title = [row.shortDesc, row.slaName].filter(Boolean).join('\n');
             rowEl.addEventListener('click', e => {
                 if (e.target.closest('button')) return;
                 window.open(`${location.origin}/${row.table}.do?sys_id=${encodeURIComponent(row.taskSysId)}&sysparm_stack=no`, '_blank');
@@ -1964,7 +1987,7 @@
         },
 
         // Answers "why is the panel empty?" — lists every OLA/SLA name currently
-        // running on the group's tickets, so a mismatched CONFIG.OLA_NAME is one
+        // running on the group's tickets, so a name missing from CONFIG.OLA_NAMES is one
         // console call away from being obvious instead of looking like "nothing at risk".
         async listSlaNames() {
             const gid = await resolveGroupSysId();
@@ -1996,6 +2019,7 @@
                 const pct = computePct(r);
                 return {
                     ticket: r.number,
+                    ola: r.slaName,
                     start: r.start,
                     plannedEnd: r.plannedEnd,
                     span: s != null && e != null ? mins(e - s) : '—',
@@ -2123,6 +2147,37 @@
             check('duration zero', parseSnowDuration('1970-01-01 00:00:00') === null);
             check('duration junk', parseSnowDuration('not a duration') === null);
 
+            // ── Watching more than one OLA ──────────────────────────────────────
+            // Two names have to go out as one `IN` clause, not two `=` clauses
+            // ANDed together, which would match nothing at all.
+            check('two OLA names → IN clause',
+                olaNameClause(['INC-RES-CORP-SD', 'CTSK-RES-CORP-SD']) === 'sla.nameININC-RES-CORP-SD,CTSK-RES-CORP-SD');
+            check('one OLA name → plain equals', olaNameClause(['INC-RES-CORP-SD']) === 'sla.name=INC-RES-CORP-SD');
+            check('blank names are dropped', olaNameClause(['A', '', null, 'B']) === 'sla.nameINA,B');
+            // Silently querying every SLA on the group would fill the panel with
+            // clocks nobody asked to watch, so an empty list is an error.
+            let emptyThrew = false;
+            try { olaNameClause([]); } catch { emptyThrew = true; }
+            check('empty OLA list throws', emptyThrew);
+
+            // Length is per row, never assumed: the 4-hour CTSK-RES OLA and the
+            // 1-hour INC-RES one are the same arithmetic on different timestamps.
+            // Same start, same "now", four times the window → a quarter of the
+            // percentage, and four hours' countdown instead of one.
+            const fourHour = row(pIso(2026, 8, 4, 9, 0), pIso(2026, 8, 4, 13, 0), { slaDuration: '1970-01-01 04:00:00' });
+            const oneHour  = row(pIso(2026, 8, 4, 9, 0), pIso(2026, 8, 4, 10, 0), { slaDuration: '1970-01-01 01:00:00' });
+            const at0945 = pMs(2026, 8, 4, 9, 45);
+            check('4h OLA is 18.75% at 45 minutes', Math.abs(computePct(fourHour, at0945) - 18.75) < 0.5);
+            check('1h OLA is 75% at the same moment', Math.abs(computePct(oneHour, at0945) - 75) < 0.5);
+            check('4h OLA is not yet worth showing', computePct(fourHour, at0945) < CONFIG.SHOW_AT);
+            check('4h OLA reaches 75% at three hours', Math.abs(computePct(fourHour, pMs(2026, 8, 4, 12, 0)) - 75) < 0.5);
+            check('4h countdown is the full remainder',
+                Math.abs(msRemaining(fourHour, at0945) - 3.25 * 60 * 60 * 1000) < 1000);
+            check('4h OLA duration parses', parseSnowDuration('1970-01-01 04:00:00') === 4 * 60 * 60 * 1000);
+            // A 4-hour window opened at 09:00 fits inside the 08:00–19:00 day, so
+            // its clock plainly ran straight through — same test as the 1-hour one.
+            check('4h OLA span == duration → continuous', clockPauses(fourHour) === false);
+
             // ── Ribbon placement ────────────────────────────────────────────────
             // firstFreeX is the whole no-overlap rule: the ribbon goes after the
             // right edge of the furthest-right tab, in the tabs' own coordinate
@@ -2186,5 +2241,5 @@
     pageWindow.__olaWatchDebug = debugApi;
     window.__olaWatchDebug = debugApi;
 
-    console.log(`[OLA Watch] v${SCRIPT_VERSION} loaded on ${location.hostname} — group ${CONFIG.ASSIGNMENT_GROUP}, OLA ${CONFIG.OLA_NAME}, show@${CONFIG.SHOW_AT}% crit@${CONFIG.CRIT_AT}% notify@${CONFIG.NOTIFY_AT.join('/')}%`);
+    console.log(`[OLA Watch] v${SCRIPT_VERSION} loaded on ${location.hostname} — group ${CONFIG.ASSIGNMENT_GROUP}, OLAs ${CONFIG.OLA_NAMES.join(' + ')}, show@${CONFIG.SHOW_AT}% crit@${CONFIG.CRIT_AT}% notify@${CONFIG.NOTIFY_AT.join('/')}%`);
 })();
